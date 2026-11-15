@@ -8,7 +8,6 @@ The UI is in French.
 
 ## Stack
 
-### Primary Stack (Tauri v2 + Auto-Update — see [stack.md](./stack.md) and [PLAN/to-tauri.md](./PLAN/to-tauri.md))
 | Layer | Choice |
 |---|---|
 | Desktop Framework | Tauri v2 (Rust backend in `src-tauri/` + native Windows WebView2) |
@@ -20,16 +19,6 @@ The UI is in French.
 | Automatic Updates | `tauri-plugin-updater` + `tauri-plugin-process` + Minisign-signed GitHub Releases (`latest.json`) |
 | Installer | Windows NSIS (`currentUser` install mode, passive updater mode) |
 
-### Legacy Stack (Preserved Alongside Tauri During Transition)
-| Layer | Choice |
-|---|---|
-| Backend | FastAPI (`app.py`) + Uvicorn on `http://127.0.0.1:8000` |
-| Video Processing | FFmpeg / FFprobe via `imageio-ffmpeg` + `subprocess.Popen` |
-| Folder Picker | `tkinter.filedialog.askdirectory` in a dedicated thread |
-| Recycle Bin Deletion | Python `send2trash` (`1.8.3`) |
-| Frontend | Jinja2 HTML (`templates/index.html`) + Bootstrap 5.3 CDN + Vanilla JS (`static/js/app.js`) + CSS (`static/css/style.css`) |
-| Desktop Packaging | PyInstaller (`VideoShrinker.spec`) + Electron 31 (`electron/main.js`, `electron-builder` NSIS) |
-
 ## Project structure
 
 ```text
@@ -37,7 +26,7 @@ lgo-video-shrinker/
 ├── .github/
 │   ├── agents/                        # Custom Copilot agents aligned with Tauri v2 + auto-update
 │   │   ├── deployment.agent.md        # Git/GitHub release, signing keys, CI/CD & auto-update delivery specialist
-│   │   ├── developer.agent.md         # Implementation & bug-fix specialist (Rust/Tauri, Vite/JS, legacy migration)
+│   │   ├── developer.agent.md         # Implementation & bug-fix specialist (Rust/Tauri, Vite/JS)
 │   │   ├── orchestrator.agent.md      # Delivery coordinator across PM, Developer, QA, and Deployment
 │   │   ├── product-manager.agent.md   # Requirements, user stories, and acceptance criteria specialist
 │   │   └── qa.agent.md                # Non-regression testing (TNR) and verification specialist
@@ -50,7 +39,7 @@ lgo-video-shrinker/
 │   └── workflows/
 │       └── release.yml                # GitHub Actions CI/CD for signed Tauri v2 NSIS releases & latest.json
 ├── PLAN/
-│   └── to-tauri.md                    # 6-phase migration plan from Python/Electron to Tauri v2 + auto-update
+│   └── to-tauri.md                    # Completed migration plan from Python/Electron to Tauri v2 + auto-update
 ├── scripts/
 │   ├── release.ps1                    # Automated SemVer version bump, commit, git tag, push & GH Actions watcher
 │   └── setup-updater-keys.ps1         # Generates Minisign keypair, updates tauri.conf.json pubkey & sets GH secret
@@ -67,7 +56,7 @@ lgo-video-shrinker/
 │   ├── tauri.conf.json                # Window (1400x900), NSIS currentUser bundle, sidecars, updater endpoint & pubkey
 │   ├── capabilities/
 │   │   └── default.json               # Tauri v2 permissions (core, dialog, opener, process, updater, shell)
-│   ├── binaries/                      # Bundled Windows x64 sidecars
+│   ├── binaries/                      # Bundled Windows x64 sidecars (gitignored; auto-downloaded in CI)
 │   │   ├── ffmpeg-x86_64-pc-windows-msvc.exe
 │   │   └── ffprobe-x86_64-pc-windows-msvc.exe
 │   ├── icons/                         # Application icons (32x32.png, 128x128.png, 128x128@2x.png, icon.png, icon.ico)
@@ -79,27 +68,10 @@ lgo-video-shrinker/
 │       ├── scanner.rs                 # Recursive MP4 scanner, Windows long-path (\\?\) normalization, ffprobe parser + unit tests
 │       ├── compressor.rs              # HW encoder probe, FFmpeg presets, async stderr progress parser, cancellation + unit/E2E tests
 │       └── files.rs                   # Native folder dialog, Recycle Bin deletion (single/batch), Explorer reveal, video playback + tests
-├── electron/                          # Legacy Electron wrapper
-│   ├── main.js                        # Spawns VideoShrinker.exe or app.py, polls :8000, opens BrowserWindow (1400x900)
-│   ├── package.json                   # Electron 31 & electron-builder NSIS configuration
-│   └── preload.js                     # Preload script (contextIsolation: true, nodeIntegration: false)
-├── static/                            # Legacy static frontend assets
-│   ├── css/
-│   │   └── style.css                  # Legacy CSS styles
-│   └── js/
-│       └── app.js                     # Legacy fetch/WebSocket frontend script
-├── templates/
-│   └── index.html                     # Legacy Jinja2 template served by FastAPI
+├── .gitignore                         # Excludes target/, node_modules/, dist-frontend/, binaries/*.exe, and *.key
 ├── package.json                       # Root Vite + Tauri CLI & frontend dependencies
-├── vite.config.js                     # Vite bundler configuration (root: src, outDir: ../dist-frontend)
-├── VideoShrinker.spec                 # Legacy PyInstaller single-file build specification
-├── app.py                             # Legacy FastAPI backend
-├── build.bat                          # Legacy PyInstaller build script
-├── build_all.bat                      # Legacy two-phase PyInstaller + Electron build script
-├── build_electron.bat                 # Legacy Electron-only build script
-├── run_electron.bat                   # Legacy Electron dev launcher
-├── requirements.txt                   # Legacy Python dependencies
-├── stack.md                           # Target Tauri v2 + auto-update architecture specification
+├── vite.config.js                     # Vite bundler configuration (root: src, outDir: ../dist-frontend, port: 1420)
+├── STACK.md                           # Tauri v2 + auto-update architecture specification
 ├── CHANGELOG.md                       # Chronological change history (source for latest changes)
 └── CONTEXT.md                         # Architecture and current implementation context
 ```
@@ -173,32 +145,25 @@ See [CHANGELOG.md](./CHANGELOG.md) for the chronological history of changes.
 
 ## Common commands
 
-### Current Legacy Commands (Python + Electron)
-```powershell
-# Run FastAPI backend directly in dev mode (opens browser on http://127.0.0.1:8000)
-python app.py
-
-# Run Electron wrapper in dev mode (falls back to python app.py --no-browser if dist exe is absent)
-.\run_electron.bat
-
-# Build standalone Python executable with PyInstaller
-.\build.bat
-
-# Build full PyInstaller + Electron NSIS installer
-.\build_all.bat
-```
-
-### Target Tauri v2 Commands (see [PLAN/to-tauri.md](./PLAN/to-tauri.md))
 ```powershell
 # Start Vite + Tauri in development mode with hot reload
 npm run tauri dev
+
+# Build frontend bundle only
+npm run build
 
 # Type-check and test Rust backend
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 
-# Build production Windows NSIS installer and signed updater artifacts
+# Build production Windows NSIS installer and signed updater artifacts locally
 npm run tauri build
+
+# Generate Tauri updater Minisign keypair and configure GitHub Secret
+npm run setup:keys
+
+# Bump SemVer version, commit, tag vX.Y.Z, push to GitHub, and watch the release workflow
+npm run release -- -Version 1.0.1 -Watch
 ```
 
 ## Current capabilities
