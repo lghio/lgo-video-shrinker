@@ -1,0 +1,28 @@
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+
+# Large FFmpeg sidecar binaries (>100 MB; downloaded automatically in CI by .github/workflows/release.yml)
+src-tauri/binaries/*.exe
+
+# Node / Vite frontend build
+node_modules/
+dist-frontend/
+
+# Legacy Python / PyInstaller / Electron artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+electron/node_modules/
+electron/dist/
+
+# Secrets & Tauri updater private keys (NEVER commit private keys)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx

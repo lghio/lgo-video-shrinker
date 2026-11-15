@@ -1,0 +1,394 @@
+:root {
+    --primary-color: #3498db;
+    --success-color: #2ecc71;
+    --warning-color: #f39c12;
+    --danger-color: #e74c3c;
+}
+
+body {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.container {
+    max-width: 1200px;
+}
+
+header h1 {
+    color: white;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+
+header p {
+    color: rgba(255,255,255,0.9);
+}
+
+header code {
+    background: rgba(255,255,255,0.2);
+    color: white;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.card {
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    transition: transform 0.3s ease;
+}
+
+.card:hover {
+    transform: translateY(-5px);
+}
+
+.video-card {
+    background: white;
+}
+
+.video-header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 1rem;
+    border-radius: 15px 15px 0 0;
+}
+
+.video-info {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1rem;
+    margin: 1rem 0;
+}
+
+.info-item {
+    text-align: center;
+    padding: 0.5rem;
+    background: #f8f9fa;
+    border-radius: 8px;
+}
+
+.info-item strong {
+    display: block;
+    color: #666;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+}
+
+.info-item span {
+    display: block;
+    font-size: 1.1rem;
+    color: #333;
+}
+
+.quality-selector {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0;
+}
+
+.quality-btn {
+    flex: 1;
+    padding: 0.5rem;
+    border: 2px solid #ddd;
+    background: white;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.quality-btn:hover {
+    border-color: var(--primary-color);
+}
+
+.quality-btn.active {
+    background: var(--primary-color);
+    color: white;
+    border-color: var(--primary-color);
+}
+
+.progress {
+    height: 30px;
+    border-radius: 15px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    font-size: 0.9rem;
+    font-weight: bold;
+    transition: width 0.3s ease;
+}
+
+.compression-result {
+    background: #d4edda;
+    border: 1px solid #c3e6cb;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: 1rem;
+}
+
+.btn {
+    border-radius: 8px;
+    padding: 0.5rem 1.5rem;
+    font-weight: 500;
+    transition: all 0.3s ease;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+}
+
+#scanBtn {
+    width: 100%;
+}
+
+.spinner-border-sm {
+    width: 1rem;
+    height: 1rem;
+    margin-right: 0.5rem;
+}
+
+/* Styles pour les checkboxes */
+.video-header .form-check {
+    margin-left: 1rem;
+}
+
+.video-header .form-check-input {
+    width: 1.5rem;
+    height: 1.5rem;
+    cursor: pointer;
+    border: 2px solid white;
+}
+
+.video-header .form-check-input:checked {
+    background-color: #2ecc71;
+    border-color: #2ecc71;
+}
+
+.video-header .form-check-label {
+    font-size: 0.9rem;
+    margin-left: 0.5rem;
+    cursor: pointer;
+}
+
+/* Styles pour les actions batch */
+#batchActions .card-body {
+    background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+}
+
+#batchProgress {
+    background: white;
+    padding: 1rem;
+    border-radius: 8px;
+}
+
+/* Styles pour les chemins de fichiers */
+.file-paths {
+    background: #f8f9fa;
+    padding: 1rem;
+    border-radius: 8px;
+    border-left: 4px solid var(--primary-color);
+}
+
+.path-item {
+    margin-bottom: 0.5rem;
+}
+
+.path-item strong {
+    display: block;
+    color: #333;
+    font-size: 0.9rem;
+    margin-bottom: 0.25rem;
+}
+
+.path-display {
+    background: white;
+    padding: 0.5rem;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    color: #555;
+    word-break: break-all;
+    border: 1px solid #dee2e6;
+}
+
+.compressed-path-item {
+    border-left: 4px solid var(--success-color);
+    padding-left: 0.5rem;
+}
+
+/* Bouton delete */
+.delete-btn {
+    white-space: nowrap;
+}
+
+.delete-btn:hover {
+    background-color: #c82333 !important;
+    transform: scale(1.05);
+}
+
+/* Boutons de lecture vidéo */
+.play-original-btn,
+.play-compressed-btn {
+    white-space: nowrap;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.75rem;
+}
+
+.play-original-btn:hover {
+    transform: scale(1.05);
+}
+
+.play-compressed-btn:hover {
+    transform: scale(1.05);
+}
+
+/* ===================== */
+/* Layout 2 colonnes     */
+/* ===================== */
+.app-layout {
+    display: flex;
+    min-height: 100vh;
+    position: relative;
+}
+
+.main-content {
+    flex: 1;
+    min-width: 0;
+    transition: margin-right 0.3s ease;
+}
+
+/* ===================== */
+/* Panneau de logs       */
+/* ===================== */
+:root {
+    --log-panel-width: 420px;
+}
+
+/* Splitter drag handle */
+.log-splitter {
+    width: 6px;
+    min-width: 6px;
+    background: #2a2a4a;
+    border-left: 1px solid #3a3a5c;
+    border-right: 1px solid #3a3a5c;
+    cursor: col-resize;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    z-index: 101;
+    transition: background 0.15s;
+    flex-shrink: 0;
+}
+
+.log-splitter:hover,
+.log-splitter.dragging {
+    background: #4a4a8a;
+}
+
+.log-panel {
+    width: var(--log-panel-width);
+    min-width: 180px;
+    background: #1a1a2e;
+    border-left: 2px solid #3a3a5c;
+    display: flex;
+    flex-direction: column;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow: hidden;
+    /* transition uniquement pour le collapse, désactivée pendant le drag (via .resizing) */
+    transition: min-width 0.3s ease, width 0.3s ease;
+    z-index: 100;
+}
+
+.log-panel.collapsed {
+    width: 42px !important;
+    min-width: 42px !important;
+}
+
+/* Splitter caché quand le panneau est réduit (géré en JS) */
+.log-splitter.hidden {
+    display: none;
+}
+
+.log-panel-header {
+    background: #16213e;
+    color: #a0a0c0;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #3a3a5c;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.log-panel.collapsed .log-panel-header span:first-child,
+.log-panel.collapsed #logClearBtn,
+.log-panel.collapsed #logStatus {
+    display: none;
+}
+
+.log-panel.collapsed #logToggleBtn {
+    transform: rotate(180deg);
+}
+
+.log-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.5rem;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+}
+
+.log-panel.collapsed .log-body {
+    display: none;
+}
+
+.log-entry {
+    padding: 0.15rem 0.3rem;
+    border-radius: 3px;
+    margin-bottom: 2px;
+    word-break: break-all;
+    white-space: pre-wrap;
+}
+
+.log-entry .log-time {
+    color: #555577;
+    margin-right: 0.4rem;
+    font-size: 0.68rem;
+}
+
+.log-entry.INFO    { color: #8888cc; }
+.log-entry.DEBUG   { color: #556677; }
+.log-entry.WARNING { color: #cc9944; background: rgba(200,150,0,0.07); }
+.log-entry.ERROR   { color: #ee5566; background: rgba(200,50,50,0.1); }
+.log-entry.PROGRESS { color: #44cc88; }
+.log-entry.SUCCESS  { color: #44dd88; background: rgba(0,180,80,0.07); }
+
+/* Indicateur de statut connexion */
+.log-status { font-size: 0.75rem; }
+.log-status-connected    { color: #44cc88; }
+.log-status-connecting   { color: #cc9944; }
+.log-status-disconnected { color: #ee5566; }
+
+/* Scrollbar fine pour le panneau logs */
+.log-body::-webkit-scrollbar { width: 4px; }
+.log-body::-webkit-scrollbar-track { background: #1a1a2e; }
+.log-body::-webkit-scrollbar-thumb { background: #3a3a5c; border-radius: 2px; }
+
+/* Pendant le drag du splitter : désactiver les transitions + curseur global */
+body.log-resizing {
+    cursor: col-resize !important;
+    user-select: none;
+}
+
+body.log-resizing .log-panel {
+    transition: none !important;
+}

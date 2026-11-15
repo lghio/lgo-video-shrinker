@@ -1,0 +1,62 @@
+{
+    "$schema":  "https://schema.tauri.app/config/2",
+    "productName":  "VideoShrinker",
+    "version":  "1.0.0",
+    "identifier":  "com.lgo.videoshrinker",
+    "build":  {
+                  "frontendDist":  "../dist-frontend",
+                  "devUrl":  "http://localhost:1420",
+                  "beforeDevCommand":  "npm run dev",
+                  "beforeBuildCommand":  "npm run build"
+              },
+    "app":  {
+                "windows":  [
+                                {
+                                    "label":  "main",
+                                    "title":  "VideoShrinker",
+                                    "width":  1400,
+                                    "height":  900,
+                                    "minWidth":  900,
+                                    "minHeight":  600,
+                                    "resizable":  true,
+                                    "center":  true
+                                }
+                            ],
+                "security":  {
+                                 "csp":  null
+                             }
+            },
+    "bundle":  {
+                   "active":  true,
+                   "targets":  [
+                                   "nsis"
+                               ],
+                   "createUpdaterArtifacts":  true,
+                   "externalBin":  [
+                                       "binaries/ffmpeg",
+                                       "binaries/ffprobe"
+                                   ],
+                   "icon":  [
+                                "icons/32x32.png",
+                                "icons/128x128.png",
+                                "icons/128x128@2x.png",
+                                "icons/icon.ico"
+                            ],
+                   "windows":  {
+                                   "nsis":  {
+                                                "installMode":  "currentUser"
+                                            }
+                               }
+               },
+    "plugins":  {
+                    "updater":  {
+                                    "pubkey":  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNEQjJDODIwMkEyRjJCMDYKUldRR0t5OHFJTWl5UGJ6VG9RZVhKNkhPaVJ0U3V5eFpNcnZYZjBBWHIrTjNDT1kyOUw1Uk9LWGoK",
+                                    "endpoints":  [
+                                                      "https://github.com/lghio/lgo-video-shrinker/releases/latest/download/latest.json"
+                                                  ],
+                                    "windows":  {
+                                                    "installMode":  "passive"
+                                                }
+                                }
+                }
+}

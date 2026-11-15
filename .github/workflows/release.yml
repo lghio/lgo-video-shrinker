@@ -1,0 +1,67 @@
+name: Release VideoShrinker (Tauri v2)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-tauri:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cargo cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Download static FFmpeg & FFprobe sidecar binaries if missing
+        shell: pwsh
+        run: |
+          $binDir = "src-tauri/binaries"
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          $ffmpegTarget = "$binDir/ffmpeg-x86_64-pc-windows-msvc.exe"
+          $ffprobeTarget = "$binDir/ffprobe-x86_64-pc-windows-msvc.exe"
+          if (-not (Test-Path $ffmpegTarget) -or -not (Test-Path $ffprobeTarget)) {
+            Write-Host "Downloading static FFmpeg build for Windows x64..."
+            $zipUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            $zipPath = "$env:TEMP/ffmpeg-release.zip"
+            $extractDir = "$env:TEMP/ffmpeg-extract"
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+            $ffmpegExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+            $ffprobeExe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+            Copy-Item -Force $ffmpegExe.FullName $ffmpegTarget
+            Copy-Item -Force $ffprobeExe.FullName $ffprobeTarget
+          }
+
+      - name: Build and publish Tauri v2 NSIS installer & updater artifacts
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'VideoShrinker v__VERSION__'
+          releaseBody: 'Téléchargez l''installateur Windows NSIS ci-dessous ou utilisez la mise à jour automatique intégrée à VideoShrinker.'
+          releaseDraft: false
+          prerelease: false
