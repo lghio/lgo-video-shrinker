@@ -36,8 +36,9 @@ The UI is in French.
 lgo-video-shrinker/
 ├── .github/
 │   ├── agents/                        # Custom Copilot agents aligned with Tauri v2 + auto-update
+│   │   ├── deployment.agent.md        # Git/GitHub release, signing keys, CI/CD & auto-update delivery specialist
 │   │   ├── developer.agent.md         # Implementation & bug-fix specialist (Rust/Tauri, Vite/JS, legacy migration)
-│   │   ├── orchestrator.agent.md      # Delivery coordinator across PM, Developer, and QA
+│   │   ├── orchestrator.agent.md      # Delivery coordinator across PM, Developer, QA, and Deployment
 │   │   ├── product-manager.agent.md   # Requirements, user stories, and acceptance criteria specialist
 │   │   └── qa.agent.md                # Non-regression testing (TNR) and verification specialist
 │   ├── copilot-instructions.md        # Repository-wide Copilot rules and security constraints
@@ -50,6 +51,9 @@ lgo-video-shrinker/
 │       └── release.yml                # GitHub Actions CI/CD for signed Tauri v2 NSIS releases & latest.json
 ├── PLAN/
 │   └── to-tauri.md                    # 6-phase migration plan from Python/Electron to Tauri v2 + auto-update
+├── scripts/
+│   ├── release.ps1                    # Automated SemVer version bump, commit, git tag, push & GH Actions watcher
+│   └── setup-updater-keys.ps1         # Generates Minisign keypair, updates tauri.conf.json pubkey & sets GH secret
 ├── src/                               # Tauri v2 + Vite frontend source
 │   ├── index.html                     # French UI with auto-update banner (#updateBanner) and version/encoder badges
 │   ├── css/
