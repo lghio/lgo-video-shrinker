@@ -22,6 +22,8 @@ pub struct VideoItem {
     pub relative_path: String,
     pub is_already_compressed: bool,
     pub compressed_path: Option<String>,
+    pub compressed_size_gb: Option<f64>,
+    pub reduction_percent: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -117,6 +119,10 @@ pub fn normalize_path(p: &str) -> String {
 
 pub fn get_file_size_gb(size_bytes: u64) -> f64 {
     (size_bytes as f64) / 1_073_741_824.0
+}
+
+pub fn round_1(val: f64) -> f64 {
+    (val * 10.0).round() / 10.0
 }
 
 pub fn round_2(val: f64) -> f64 {
@@ -233,7 +239,10 @@ pub fn scan_directory_sync(
         }
         let file_name = entry.file_name().to_string_lossy().to_string();
         let lower_name = file_name.to_lowercase();
-        if !lower_name.ends_with(".mp4") || lower_name.ends_with(".tmp.mp4") {
+        if !lower_name.ends_with(".mp4")
+            || lower_name.ends_with(".tmp.mp4")
+            || lower_name.ends_with("_compressed.mp4")
+        {
             continue;
         }
 
@@ -242,7 +251,11 @@ pub fn scan_directory_sync(
         let stripped_entry = strip_long_prefix(&raw_entry_path);
         let file_path = normalize_path(&stripped_entry);
 
-        let metadata = match entry.metadata() {
+        let metadata = match std::fs::metadata(entry.path()).or_else(|_| {
+            entry
+                .metadata()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -264,6 +277,24 @@ pub fn scan_directory_sync(
             let compressed_path_str = compressed_path_buf.to_string_lossy().to_string();
             let is_already_compressed = compressed_path_buf.exists();
 
+            let (compressed_size_gb, reduction_percent) = if is_already_compressed {
+                match std::fs::metadata(&compressed_path_buf) {
+                    Ok(comp_meta) => {
+                        let comp_bytes = comp_meta.len();
+                        let comp_size_gb = get_file_size_gb(comp_bytes);
+                        let reduction = if size_gb > 0.0 {
+                            Some(round_1(((size_gb - comp_size_gb) / size_gb) * 100.0))
+                        } else {
+                            None
+                        };
+                        (Some(round_2(comp_size_gb)), reduction)
+                    }
+                    Err(_) => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
             let info = get_video_info(ffprobe_path, &file_path);
             let (duration, resolution, bitrate) = extract_metadata_from_probe(&info);
 
@@ -284,6 +315,8 @@ pub fn scan_directory_sync(
                 } else {
                     None
                 },
+                compressed_size_gb,
+                reduction_percent,
             });
         }
     }
@@ -429,11 +462,53 @@ mod tests {
         )
         .unwrap();
 
-        // Doit trouver lesson1.mp4 et lesson1_compressed.mp4, mais ignorer .tmp.mp4 et .txt
-        assert_eq!(resp.count, 2);
+        // Doit trouver uniquement lesson1.mp4 et exclure lesson1_compressed.mp4, .tmp.mp4 et .txt
+        assert_eq!(resp.count, 1);
         let lesson1 = resp.videos.iter().find(|v| v.name == "lesson1.mp4").unwrap();
         assert!(lesson1.is_already_compressed);
         assert!(lesson1.compressed_path.is_some());
+        assert!(lesson1.compressed_size_gb.is_some());
+        assert_eq!(lesson1.reduction_percent, Some(50.0));
+    }
+
+    #[test]
+    fn test_scan_directory_sync_excludes_compressed_case_insensitive_and_calculates_gain() {
+        let dir = tempdir().unwrap();
+        let source_video = dir.path().join("moduleA.mp4");
+        let source_comp = dir.path().join("moduleA_compressed.mp4");
+        let uppercase_comp = dir.path().join("orphan_COMPRESSED.MP4");
+        let mixedcase_comp = dir.path().join("other_Compressed.Mp4");
+
+        File::create(&source_video)
+            .unwrap()
+            .write_all(&vec![0u8; 4000])
+            .unwrap();
+        File::create(&source_comp)
+            .unwrap()
+            .write_all(&vec![0u8; 1000])
+            .unwrap();
+        File::create(&uppercase_comp)
+            .unwrap()
+            .write_all(&vec![0u8; 2000])
+            .unwrap();
+        File::create(&mixedcase_comp)
+            .unwrap()
+            .write_all(&vec![0u8; 2000])
+            .unwrap();
+
+        let resp = scan_directory_sync(
+            Path::new("nonexistent_ffprobe"),
+            &dir.path().to_string_lossy(),
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(resp.count, 1);
+        let item = &resp.videos[0];
+        assert_eq!(item.name, "moduleA.mp4");
+        assert!(item.is_already_compressed);
+        assert!(item.compressed_size_gb.is_some());
+        assert_eq!(item.reduction_percent, Some(75.0));
     }
 
     #[test]
@@ -481,7 +556,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resp.count, 2);
+        assert_eq!(resp.count, 1);
         let found = resp
             .videos
             .iter()
@@ -489,5 +564,7 @@ mod tests {
             .expect("Should find cours_long_path.mp4 inside >260 char directory");
         assert!(found.is_already_compressed);
         assert!(found.compressed_path.is_some());
+        assert!(found.compressed_size_gb.is_some());
+        assert_eq!(found.reduction_percent, Some(50.0));
     }
 }

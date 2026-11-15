@@ -874,6 +874,10 @@ mod tests {
         // 6. Vérifier scan_directory_sync après compression
         let scan_after =
             scan_directory_sync(&ffprobe_path, &dir.path().to_string_lossy(), 0.0).unwrap();
+        assert_eq!(
+            scan_after.count, 1,
+            "Compressed output should not be listed as a standalone source video"
+        );
         let orig_item = scan_after
             .videos
             .iter()
@@ -885,6 +889,8 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .ends_with("synthetic_lesson_compressed.mp4"));
+        assert!(orig_item.compressed_size_gb.is_some());
+        assert!(orig_item.reduction_percent.is_some());
     }
 
     #[test]

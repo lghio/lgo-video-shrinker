@@ -2,7 +2,7 @@ use crate::logger::{log_error, log_info, log_success};
 use crate::scanner::{normalize_path, strip_long_prefix};
 use crate::state::CREATE_NO_WINDOW;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
@@ -21,6 +21,7 @@ pub struct BrowseResponse {
 pub struct DeleteResponse {
     pub status: String,
     pub message: String,
+    pub renamed_to: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -29,6 +30,7 @@ pub struct BatchDeleteItemResult {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    pub renamed_to: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -60,6 +62,40 @@ pub fn validate_mp4_for_deletion(raw_path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// Calcule le chemin du fichier compressé correspondant `<parent>/<stem>_compressed.<ext>`.
+pub fn compute_compressed_counterpart(original_mp4_path: &Path) -> PathBuf {
+    let stem = original_mp4_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let suffix = original_mp4_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_else(|| ".mp4".to_string());
+    let parent = original_mp4_path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!("{}_compressed{}", stem, suffix))
+}
+
+/// Renomme `<stem>_compressed.<ext>` en `<stem>.<ext>` une fois le fichier original envoyé à la corbeille.
+pub fn rename_compressed_to_original(original_path: &Path) -> Result<Option<String>, String> {
+    if original_path.exists() {
+        return Err("Le fichier original existe encore sur le disque".to_string());
+    }
+    let compressed_path = compute_compressed_counterpart(original_path);
+    if !compressed_path.exists() {
+        return Ok(None);
+    }
+    std::fs::rename(&compressed_path, original_path).map_err(|e| {
+        format!(
+            "Impossible de renommer '{}' en '{}' : {}",
+            strip_long_prefix(&compressed_path.to_string_lossy()),
+            strip_long_prefix(&original_path.to_string_lossy()),
+            e
+        )
+    })?;
+    Ok(Some(strip_long_prefix(&original_path.to_string_lossy())))
+}
+
 #[tauri::command]
 pub async fn browse_directory(app: AppHandle) -> Result<BrowseResponse, String> {
     let app_clone = app.clone();
@@ -88,9 +124,14 @@ pub async fn browse_directory(app: AppHandle) -> Result<BrowseResponse, String> 
 }
 
 #[tauri::command]
-pub async fn delete_file(app: AppHandle, file_path: String) -> Result<DeleteResponse, String> {
+pub async fn delete_file(
+    app: AppHandle,
+    file_path: String,
+    rename_compressed: Option<bool>,
+) -> Result<DeleteResponse, String> {
     let normalized = validate_mp4_for_deletion(&file_path)?;
     let clean_path = strip_long_prefix(&normalized);
+    let should_rename = rename_compressed.unwrap_or(false);
 
     let target_for_trash = clean_path.clone();
     tokio::task::spawn_blocking(move || trash::delete(&target_for_trash))
@@ -102,12 +143,37 @@ pub async fn delete_file(app: AppHandle, file_path: String) -> Result<DeleteResp
             err_msg
         })?;
 
-    let msg = format!("Fichier envoyé à la corbeille : {}", normalized);
+    let mut msg = format!("Fichier envoyé à la corbeille : {}", clean_path);
     log_success(&app, format!("[CORBEILLE] {}", msg));
+
+    let mut renamed_to: Option<String> = None;
+    if should_rename {
+        match rename_compressed_to_original(Path::new(&normalized)) {
+            Ok(Some(final_path)) => {
+                log_success(
+                    &app,
+                    format!(
+                        "[CORBEILLE] Fichier compressé renommé avec le nom original : {}",
+                        final_path
+                    ),
+                );
+                msg = format!(
+                    "{} (fichier compressé renommé en {})",
+                    msg, final_path
+                );
+                renamed_to = Some(final_path);
+            }
+            Ok(None) => {}
+            Err(rename_err) => {
+                log_error(&app, format!("[ERROR] {}", rename_err));
+            }
+        }
+    }
 
     Ok(DeleteResponse {
         status: "success".to_string(),
         message: msg,
+        renamed_to,
     })
 }
 
@@ -115,12 +181,14 @@ pub async fn delete_file(app: AppHandle, file_path: String) -> Result<DeleteResp
 pub async fn delete_batch(
     app: AppHandle,
     file_paths: Vec<String>,
+    rename_compressed: Option<bool>,
 ) -> Result<BatchDeleteResponse, String> {
     if file_paths.is_empty() {
         return Err("Aucun fichier à supprimer".to_string());
     }
 
     let total = file_paths.len();
+    let should_rename = rename_compressed.unwrap_or(false);
     let app_clone = app.clone();
 
     let results = tokio::task::spawn_blocking(move || {
@@ -132,6 +200,7 @@ pub async fn delete_batch(
                     path: raw_path,
                     status: "error".to_string(),
                     message: Some("Seuls les fichiers MP4 peuvent être supprimés".to_string()),
+                    renamed_to: None,
                 });
                 continue;
             }
@@ -140,6 +209,7 @@ pub async fn delete_batch(
                     path: raw_path,
                     status: "error".to_string(),
                     message: Some("Fichier introuvable".to_string()),
+                    renamed_to: None,
                 });
                 continue;
             }
@@ -151,10 +221,30 @@ pub async fn delete_batch(
                         &app_clone,
                         format!("[CORBEILLE] Fichier envoyé à la corbeille : {}", clean_path),
                     );
+                    let mut renamed_to: Option<String> = None;
+                    if should_rename {
+                        match rename_compressed_to_original(Path::new(&normalized)) {
+                            Ok(Some(final_path)) => {
+                                log_success(
+                                    &app_clone,
+                                    format!(
+                                        "[CORBEILLE] Fichier compressé renommé avec le nom original : {}",
+                                        final_path
+                                    ),
+                                );
+                                renamed_to = Some(final_path);
+                            }
+                            Ok(None) => {}
+                            Err(rename_err) => {
+                                log_error(&app_clone, format!("[ERROR] {}", rename_err));
+                            }
+                        }
+                    }
                     items.push(BatchDeleteItemResult {
                         path: raw_path,
                         status: "success".to_string(),
                         message: None,
+                        renamed_to,
                     });
                 }
                 Err(err) => {
@@ -169,6 +259,7 @@ pub async fn delete_batch(
                         path: raw_path,
                         status: "error".to_string(),
                         message: Some(err.to_string()),
+                        renamed_to: None,
                     });
                 }
             }
@@ -280,5 +371,70 @@ mod tests {
 
         let validated = validate_mp4_for_deletion(&mp4_path.to_string_lossy());
         assert!(validated.is_ok());
+    }
+
+    #[test]
+    fn test_compute_compressed_counterpart() {
+        let p = Path::new(r"C:\Videos\Cours\module_1.mp4");
+        assert_eq!(
+            compute_compressed_counterpart(p),
+            PathBuf::from(r"C:\Videos\Cours\module_1_compressed.mp4")
+        );
+
+        let p_upper = Path::new(r"C:\Videos\CLIP.MP4");
+        assert_eq!(
+            compute_compressed_counterpart(p_upper),
+            PathBuf::from(r"C:\Videos\CLIP_compressed.MP4")
+        );
+    }
+
+    #[test]
+    fn test_rename_compressed_to_original_renames_and_preserves_content() {
+        use std::io::{Read, Write};
+
+        let dir = tempdir().unwrap();
+        let orig_path = dir.path().join("lesson1.mp4");
+        let comp_path = dir.path().join("lesson1_compressed.mp4");
+
+        // Tant que le fichier original existe encore sur le disque, le renommage est refusé
+        File::create(&orig_path)
+            .unwrap()
+            .write_all(b"original-video-bytes")
+            .unwrap();
+        File::create(&comp_path)
+            .unwrap()
+            .write_all(b"compressed-video-bytes")
+            .unwrap();
+
+        assert!(rename_compressed_to_original(&orig_path).is_err());
+
+        // Simuler que le fichier original a été envoyé à la corbeille (n'est plus dans le dossier)
+        let trashed_simulation_path = dir.path().join("recycled_lesson1.bak");
+        std::fs::rename(&orig_path, &trashed_simulation_path).unwrap();
+        assert!(!orig_path.exists());
+
+        // Renommer _compressed.mp4 avec le nom original
+        let renamed = rename_compressed_to_original(&orig_path)
+            .expect("rename_compressed_to_original should succeed")
+            .expect("Expected Some(renamed_path)");
+
+        assert_eq!(renamed, orig_path.to_string_lossy().to_string());
+        assert!(orig_path.exists());
+        assert!(!comp_path.exists());
+
+        let mut content = String::new();
+        File::open(&orig_path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "compressed-video-bytes");
+    }
+
+    #[test]
+    fn test_rename_compressed_to_original_returns_none_when_counterpart_missing() {
+        let dir = tempdir().unwrap();
+        let missing_orig = dir.path().join("no_counterpart.mp4");
+        let res = rename_compressed_to_original(&missing_orig).unwrap();
+        assert!(res.is_none());
     }
 }

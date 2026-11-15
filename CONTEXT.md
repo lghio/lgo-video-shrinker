@@ -39,9 +39,10 @@ lgo-video-shrinker/
 │   └── workflows/
 │       └── release.yml                # GitHub Actions CI/CD for signed Tauri v2 NSIS releases & latest.json
 ├── PLAN/
-│   └── to-tauri.md                    # Completed migration plan from Python/Electron to Tauri v2 + auto-update
+│   ├── to-tauri.md                    # Completed migration plan from Python/Electron to Tauri v2 + auto-update
+│   └── v2.md                          # Product & technical roadmap for v1.1.0 -> v2.0.0 (14 tasks across 4 phases)
 ├── scripts/
-│   ├── release.ps1                    # Automated SemVer version bump, commit, git tag, push & GH Actions watcher
+│   ├── release.ps1                    # Pre-release Git/TNR check, SemVer version bump, commit, git tag, push & GH Actions watcher
 │   └── setup-updater-keys.ps1         # Generates Minisign keypair, updates tauri.conf.json pubkey & sets GH secret
 ├── src/                               # Tauri v2 + Vite frontend source
 │   ├── index.html                     # French UI with auto-update banner (#updateBanner) and version/encoder badges
@@ -112,11 +113,12 @@ See [CHANGELOG.md](./CHANGELOG.md) for the chronological history of changes.
 - Only when `ffmpeg` exits with code `0` is `<stem>_compressed.tmp.mp4` atomically renamed to `<stem>_compressed.mp4`.
 - If `ffmpeg` fails, is stopped by the user, or the app closes, the active child process is terminated and `<stem>_compressed.tmp.mp4` is deleted immediately so partial files are never mistaken for completed compressions.
 
-### Safe Deletion via Windows Recycle Bin
+### Safe Deletion via Windows Recycle Bin & Optional Original Filename Replacement
 - Single deletion and batch deletion strictly validate that:
   1. The path is non-empty and exists on disk.
   2. The file extension is `.mp4` (case-insensitive).
-- Files are never permanently unlinked; they are sent to the **Windows Recycle Bin** (`send2trash` in Python, `trash::delete` in Rust).
+- Files are never permanently unlinked; they are sent to the **Windows Recycle Bin** (`trash::delete` in Rust).
+- When `rename_compressed` is enabled (`true`), after `trash::delete` succeeds on `<stem>.mp4`, `<stem>_compressed.mp4` is automatically renamed to `<stem>.mp4` (`rename_compressed_to_original` in `src-tauri/src/files.rs`) so directory filenames and shortcuts remain unchanged.
 - In the frontend UI, the individual **"🗑️ Supprimer l'original"** button and the **"♻️ Supprimer les originaux"** batch modal filter only allow deleting originals that already have a `_compressed.mp4` file on disk.
 
 ### Frontend 2-Column Layout & Resizable Log Panel
@@ -137,8 +139,8 @@ See [CHANGELOG.md](./CHANGELOG.md) for the chronological history of changes.
 | Scan directory | `GET /api/scan?directory=...&min_size_gb=...` | `invoke('scan_videos', { directory, minSizeGb })` |
 | Start compression | `WS /ws/compress/{video_index}` | `invoke('start_compression', { videoIndex, inputPath, quality })` + `listen('compression://event')` |
 | Stop compression | `POST /api/stop-compression` | `invoke('stop_compression', { videoIndex })` |
-| Delete single original | `POST /api/delete` | `invoke('delete_file', { filePath })` |
-| Delete batch originals | `POST /api/delete-batch` | `invoke('delete_batch', { filePaths })` |
+| Delete single original | `POST /api/delete` | `invoke('delete_file', { filePath, renameCompressed })` |
+| Delete batch originals | `POST /api/delete-batch` | `invoke('delete_batch', { filePaths, renameCompressed })` |
 | Reveal in Explorer | `POST /api/open-folder` | `invoke('open_folder', { filePath })` |
 | Play in default player | `POST /api/play-video` | `invoke('play_video', { filePath })` |
 | Real-time logs | `WS /ws/logs` | `listen('server://log')` |
@@ -152,9 +154,12 @@ npm run tauri dev
 # Build frontend bundle only
 npm run build
 
-# Type-check and test Rust backend
+# Run full TNR suite (Vite frontend build + Rust unit & E2E tests)
+npm test
+
+# Type-check and test Rust backend only
 cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run test:rust
 
 # Build production Windows NSIS installer and signed updater artifacts locally
 npm run tauri build
@@ -169,19 +174,22 @@ npm run release -- -Version 1.0.1 -Watch
 ## Current capabilities
 
 - Recursive `.mp4` directory scanning with minimum size filtering (`Tous les MP4`, `≥ 100 MB`, `≥ 500 MB`, `≥ 1 GB`, `≥ 2 GB`, `≥ 5 GB`) and descending size sort.
-- Automatic detection of existing `<stem>_compressed.mp4` files (pre-unchecks already compressed videos during scan).
+- Persistence of the last scanned directory, up to 5 recent folders (quick-select chips + `<datalist>`), and minimum size filter in `localStorage`, plus smart default directory fallback (`%USERPROFILE%\Videos`) and folder Drag & Drop onto the window.
+- Automatic exclusion of `*_compressed.mp4` and `*.tmp.mp4` artifacts from standalone scan results, with automatic detection of existing `<stem>_compressed.mp4` counterparts (pre-unchecks already compressed videos and displays existing compressed size in GB and `%` reduction).
 - Video metadata extraction via `ffprobe` (file size in GB, duration, resolution `WxH`, bitrate in Mbps).
-- Hardware-accelerated H.264 compression (`h264_nvenc`, `h264_qsv`, `h264_amf`, or CPU `libx264`) with 3 quality presets (`Rapide`, `Équilibré`, `Lent`).
+- Hardware-accelerated H.264 compression (`h264_nvenc`, `h264_qsv`, `h264_amf`, or CPU `libx264`) with 3 quality presets (`Rapide`, `Équilibré`, `Lent`) per card and a global batch quality selector in `#batchActions`.
 - Single-video and sequential batch compression with real-time progress bars, elapsed time / total duration display, size reduction summary, and cancellation support.
 - Direct actions per video card to play the original or compressed video in VLC/default player and reveal the file in Windows Explorer.
-- Single and batch deletion of original `.mp4` files to the Windows Recycle Bin with confirmation modal and skipped-file protection for uncompressed videos.
+- Single and batch deletion of original `.mp4` files to the Windows Recycle Bin with confirmation modal, skipped-file protection for uncompressed videos, and optional automatic renaming of `<stem>_compressed.mp4` to `<stem>.mp4`.
 - Resizable, collapsible real-time server/FFmpeg log panel.
 
 ## Planned / next features
 
-- **Tauri v2 + Auto-Update Migration**: Full architecture specification in [stack.md](./stack.md) and step-by-step migration plan in [PLAN/to-tauri.md](./PLAN/to-tauri.md).
-- **In-App Update Notification Banner**: Automatic startup check against GitHub Releases `latest.json` with one-click download and restart.
-- **GitHub Actions Release Workflow**: Automated Windows NSIS build, Minisign update signing, and GitHub Release publication on `v*` tags.
+- **Roadmap v2 ([PLAN/v2.md](./PLAN/v2.md))**:
+  - **Phase 1 (`v1.1.0`) — Completed**: Exclude `*_compressed.mp4` from scan & show existing compressed size/savings (#4), persist last/recent scan directories & min size filter + Drag & Drop (#1), global batch quality selector (#2), and optional rename of `_compressed.mp4` to original filename after Recycle Bin deletion (#9).
+  - **Phase 2 (`v1.2.0`)**: Client-side search/filter/sort (#3), encoding speed & ETA (#8), end-of-batch summary (#12), and Windows sleep prevention (#13).
+  - **Phase 3 (`v1.3.0`)**: Parallel `ffprobe` scan with progress bar (#5), OneDrive Cloud-only placeholder detection (#11), and Smart Skip anti-inflation (#7).
+  - **Phase 4 (`v2.0.0`)**: Hardware HEVC/H.265 support (#6) and multi-container support (`.mov`, `.mkv`, `.avi`, `.webm`) (#10).
 
 ## Conventions techniques
 

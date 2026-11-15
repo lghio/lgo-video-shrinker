@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -98,4 +98,48 @@ pub fn resolve_binary_path(bin_name: &str) -> PathBuf {
     }
 
     PathBuf::from(bin_name)
+}
+
+pub fn resolve_default_scan_directory() -> String {
+    if Path::new(DEFAULT_SCAN_DIRECTORY).exists() {
+        return DEFAULT_SCAN_DIRECTORY.to_string();
+    }
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let trimmed = user_profile.trim();
+        if !trimmed.is_empty() {
+            let videos_dir = PathBuf::from(trimmed).join("Videos");
+            if videos_dir.exists() {
+                return videos_dir.to_string_lossy().to_string();
+            }
+            let profile_dir = PathBuf::from(trimmed);
+            if profile_dir.exists() {
+                return profile_dir.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    DEFAULT_SCAN_DIRECTORY.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_default_scan_directory_returns_non_empty() {
+        let resolved = resolve_default_scan_directory();
+        assert!(!resolved.is_empty());
+        if !Path::new(DEFAULT_SCAN_DIRECTORY).exists() {
+            if let Ok(profile) = std::env::var("USERPROFILE") {
+                if Path::new(&profile).exists() {
+                    assert!(
+                        Path::new(&resolved).exists(),
+                        "Expected resolved fallback directory '{}' to exist",
+                        resolved
+                    );
+                }
+            }
+        }
+    }
 }

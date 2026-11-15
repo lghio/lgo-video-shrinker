@@ -9,6 +9,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:tnr": "npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "npm run test:tnr",
     "setup:keys": "powershell -ExecutionPolicy Bypass -File scripts/setup-updater-keys.ps1",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
   },

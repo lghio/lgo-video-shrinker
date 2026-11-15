@@ -4,7 +4,9 @@ pub mod logger;
 pub mod scanner;
 pub mod state;
 
-use crate::state::{resolve_binary_path, AppInfoResponse, AppState, DEFAULT_SCAN_DIRECTORY};
+use crate::state::{
+    resolve_binary_path, resolve_default_scan_directory, AppInfoResponse, AppState,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State, WindowEvent};
@@ -40,7 +42,7 @@ pub fn run() {
         hw_encoder,
         ffmpeg_path,
         ffprobe_path,
-        default_directory: DEFAULT_SCAN_DIRECTORY.to_string(),
+        default_directory: resolve_default_scan_directory(),
         active_processes: Arc::new(Mutex::new(HashMap::new())),
     };
 

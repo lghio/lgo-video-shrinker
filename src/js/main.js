@@ -7,9 +7,15 @@ import { listen } from '@tauri-apps/api/event';
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { initUpdater } from './updater.js';
 
+const STORAGE_LAST_DIR = 'lastScanDirectory';
+const STORAGE_RECENT_DIRS = 'recentScanDirectories';
+const STORAGE_LAST_MIN_SIZE = 'lastMinSizeGb';
+const MAX_RECENT_DIRS = 5;
+
 let videosData = [];
 let activeCompressions = {}; // { [videoIndex]: { unlisten: Function, cancel: Function } }
 let batchCancelled = false;  // Flag pour arrêter la compression par lots
+let currentBatchQuality = 'medium';
 
 document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('scanBtn')?.addEventListener('click', scanVideos);
@@ -22,19 +28,223 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('logToggleBtn')?.addEventListener('click', toggleLogPanel);
     document.getElementById('browseDirectoryBtn')?.addEventListener('click', browseDirectory);
 
+    const minSizeSelect = document.getElementById('minSize');
+    if (minSizeSelect) {
+        const savedMinSize = localStorage.getItem(STORAGE_LAST_MIN_SIZE);
+        if (savedMinSize !== null) {
+            const hasOption = Array.from(minSizeSelect.options).some(opt => opt.value === savedMinSize);
+            if (hasOption) {
+                minSizeSelect.value = savedMinSize;
+            }
+        }
+        minSizeSelect.addEventListener('change', (e) => {
+            localStorage.setItem(STORAGE_LAST_MIN_SIZE, e.target.value);
+        });
+    }
+
+    initBatchQualitySelector();
+    await initDragAndDrop();
     await initLogListener();
     await loadAppInfo();
     initUpdater(appendLog);
     console.log('[Init] Tous les listeners Tauri enregistrés');
 });
 
+function getRecentDirectories() {
+    try {
+        const raw = localStorage.getItem(STORAGE_RECENT_DIRS);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+            .filter(item => typeof item === 'string' && item.trim().length > 0)
+            .map(item => item.trim());
+    } catch {
+        return [];
+    }
+}
+
+function saveRecentDirectory(dirPath) {
+    if (!dirPath || typeof dirPath !== 'string') return;
+    const cleanDir = dirPath.trim();
+    if (!cleanDir) return;
+
+    localStorage.setItem(STORAGE_LAST_DIR, cleanDir);
+
+    const existing = getRecentDirectories();
+    const lowerTarget = cleanDir.toLowerCase();
+    const deduplicated = [
+        cleanDir,
+        ...existing.filter(d => d.toLowerCase() !== lowerTarget),
+    ].slice(0, MAX_RECENT_DIRS);
+
+    localStorage.setItem(STORAGE_RECENT_DIRS, JSON.stringify(deduplicated));
+    renderRecentDirectories();
+}
+
+function formatShortDirLabel(fullPath) {
+    const parts = fullPath.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
+    if (parts.length <= 2) return fullPath;
+    return `…\\${parts.slice(-2).join('\\')}`;
+}
+
+function renderRecentDirectories() {
+    const recentDirs = getRecentDirectories();
+    const datalist = document.getElementById('recentDirectoriesList');
+    const container = document.getElementById('recentDirsContainer');
+
+    if (datalist) {
+        datalist.innerHTML = '';
+        recentDirs.forEach(dir => {
+            const opt = document.createElement('option');
+            opt.value = dir;
+            datalist.appendChild(opt);
+        });
+    }
+
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (recentDirs.length === 0) {
+        container.classList.add('d-none');
+        return;
+    }
+
+    container.classList.remove('d-none');
+    const label = document.createElement('span');
+    label.className = 'recent-dirs-label';
+    label.textContent = '🕒 Récents :';
+    container.appendChild(label);
+
+    recentDirs.forEach(dir => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'recent-dir-chip';
+        chip.title = `Scanner : ${dir}`;
+        chip.dataset.dir = dir;
+        chip.textContent = `📁 ${formatShortDirLabel(dir)}`;
+        chip.addEventListener('click', () => {
+            const scanInput = document.getElementById('scanDirectory');
+            if (scanInput) {
+                scanInput.value = dir;
+            }
+            saveRecentDirectory(dir);
+            scanVideos();
+        });
+        container.appendChild(chip);
+    });
+}
+
+function initBatchQualitySelector() {
+    const batchBtns = document.querySelectorAll('.batch-quality-btn');
+    batchBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const quality = btn.getAttribute('data-quality') || 'medium';
+            batchBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            applyBatchQuality(quality);
+        });
+    });
+}
+
+function applyBatchQuality(quality) {
+    currentBatchQuality = quality;
+    const checkedBoxes = document.querySelectorAll('.video-checkbox:checked');
+    const targetCards = checkedBoxes.length > 0
+        ? Array.from(checkedBoxes).map(cb => cb.closest('.col')).filter(Boolean)
+        : Array.from(document.querySelectorAll('#videoList .col'));
+
+    targetCards.forEach(cardCol => {
+        const qualityBtns = cardCol.querySelectorAll('.quality-btn');
+        qualityBtns.forEach(b => {
+            b.classList.toggle('active', b.getAttribute('data-quality') === quality);
+        });
+    });
+}
+
+async function initDragAndDrop() {
+    const dropZone = document.getElementById('directoryDropZone');
+
+    const handleDroppedPath = (rawPath) => {
+        if (!rawPath || typeof rawPath !== 'string') return;
+        let targetDir = rawPath.trim();
+        if (!targetDir) return;
+
+        // Si un fichier .mp4 est déposé, utiliser son dossier parent
+        if (targetDir.toLowerCase().endsWith('.mp4')) {
+            targetDir = targetDir.replace(/[/\\][^/\\]+$/, '');
+        }
+        if (!targetDir) return;
+
+        const scanInput = document.getElementById('scanDirectory');
+        if (scanInput) {
+            scanInput.value = targetDir;
+        }
+        saveRecentDirectory(targetDir);
+        appendLog('INFO', `[Drag&Drop] Dossier sélectionné : ${targetDir}`);
+        scanVideos();
+    };
+
+    if (dropZone) {
+        ['dragenter', 'dragover'].forEach(evtName => {
+            dropZone.addEventListener(evtName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dropZone.classList.add('drag-over');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach(evtName => {
+            dropZone.addEventListener(evtName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dropZone.classList.remove('drag-over');
+            });
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            const firstFile = e.dataTransfer?.files?.[0];
+            if (firstFile && firstFile.path) {
+                handleDroppedPath(firstFile.path);
+            }
+        });
+    }
+
+    try {
+        await listen('tauri://drag-enter', () => {
+            dropZone?.classList.add('drag-over');
+        });
+        await listen('tauri://drag-over', () => {
+            dropZone?.classList.add('drag-over');
+        });
+        await listen('tauri://drag-leave', () => {
+            dropZone?.classList.remove('drag-over');
+        });
+        await listen('tauri://drag-drop', (event) => {
+            dropZone?.classList.remove('drag-over');
+            const paths = event.payload?.paths || (Array.isArray(event.payload) ? event.payload : []);
+            if (paths.length > 0) {
+                handleDroppedPath(paths[0]);
+            }
+        });
+    } catch (err) {
+        console.warn('Listeners tauri://drag-* non disponibles:', err);
+    }
+}
+
 async function loadAppInfo() {
     try {
         const info = await invoke('get_app_info');
         const scanInput = document.getElementById('scanDirectory');
-        if (scanInput && !scanInput.value && info.default_directory) {
-            scanInput.value = info.default_directory;
+        const savedLastDir = localStorage.getItem(STORAGE_LAST_DIR);
+        if (scanInput) {
+            if (savedLastDir && savedLastDir.trim()) {
+                scanInput.value = savedLastDir.trim();
+            } else if (!scanInput.value && info.default_directory) {
+                scanInput.value = info.default_directory;
+            }
         }
+        renderRecentDirectories();
         const versionBadge = document.getElementById('appVersionBadge');
         if (versionBadge && info.version) {
             versionBadge.textContent = `v${info.version}`;
@@ -64,6 +274,7 @@ async function browseDirectory() {
         const data = await invoke('browse_directory');
         if (data && data.status === 'ok' && data.path) {
             document.getElementById('scanDirectory').value = data.path;
+            saveRecentDirectory(data.path);
         }
     } catch (error) {
         try {
@@ -74,6 +285,7 @@ async function browseDirectory() {
             });
             if (selected && typeof selected === 'string') {
                 document.getElementById('scanDirectory').value = selected;
+                saveRecentDirectory(selected);
             }
         } catch (dialogErr) {
             console.error('Erreur browse-directory:', dialogErr);
@@ -97,6 +309,8 @@ async function scanVideos() {
         return;
     }
 
+    localStorage.setItem(STORAGE_LAST_MIN_SIZE, minSize);
+
     btn.disabled = true;
     spinner.classList.remove('d-none');
     text.textContent = ' Scan en cours...';
@@ -115,9 +329,11 @@ async function scanVideos() {
         document.getElementById('totalSize').textContent = (data.total_size_gb ?? 0) + ' GB';
         document.getElementById('potentialSaving').textContent = '~' + ((data.total_size_gb ?? 0) * 0.5).toFixed(2) + ' GB';
 
-        // Afficher le répertoire scanné
-        if (data.scanned_directory) {
-            document.getElementById('scanDirectory').value = data.scanned_directory;
+        // Afficher et mémoriser le répertoire scanné
+        const scannedDir = data.scanned_directory || directory;
+        if (scannedDir) {
+            document.getElementById('scanDirectory').value = scannedDir;
+            saveRecentDirectory(scannedDir);
         }
 
         // Afficher les vidéos
@@ -170,6 +386,9 @@ function createVideoCard(video, index) {
 
     const isCompressed = video.is_already_compressed || false;
     const checkboxChecked = !isCompressed;
+    const compressedLabel = (isCompressed && video.compressed_size_gb != null)
+        ? `📦 Fichier compressé (${video.compressed_size_gb} GB • -${video.reduction_percent ?? 0}%) :`
+        : '📦 Fichier compressé :';
 
     col.innerHTML = `
         <div class="card video-card">
@@ -221,7 +440,7 @@ function createVideoCard(video, index) {
                     </div>
                     <div class="path-item compressed-path-item ${isCompressed ? '' : 'd-none'}">
                         <div class="d-flex justify-content-between align-items-center mb-1">
-                            <strong>📦 Fichier compressé :</strong>
+                            <strong class="compressed-path-label">${compressedLabel}</strong>
                             <button class="btn btn-sm btn-success play-compressed-btn ${isCompressed ? '' : 'd-none'}" data-index="${index}" title="Lire dans VLC">
                                 ▶️ Lire compressé
                             </button>
@@ -231,15 +450,15 @@ function createVideoCard(video, index) {
                 </div>
                 
                 <div class="quality-selector">
-                    <button class="quality-btn" data-quality="low">
+                    <button class="quality-btn ${currentBatchQuality === 'low' ? 'active' : ''}" data-quality="low">
                         <div>🏃 Rapide</div>
                         <small>Qualité basse</small>
                     </button>
-                    <button class="quality-btn active" data-quality="medium">
+                    <button class="quality-btn ${currentBatchQuality === 'medium' ? 'active' : ''}" data-quality="medium">
                         <div>⚖️ Équilibré</div>
                         <small>Qualité moyenne</small>
                     </button>
-                    <button class="quality-btn" data-quality="high">
+                    <button class="quality-btn ${currentBatchQuality === 'high' ? 'active' : ''}" data-quality="high">
                         <div>🎯 Lent</div>
                         <small>Haute qualité</small>
                     </button>
@@ -258,6 +477,14 @@ function createVideoCard(video, index) {
                     <button class="btn btn-danger delete-btn ${isCompressed ? '' : 'd-none'}" data-index="${index}" title="Supprimer le fichier original">
                         🗑️ Supprimer l'original
                     </button>
+                </div>
+
+                <div class="form-check mt-2 rename-compressed-wrap ${isCompressed ? '' : 'd-none'}">
+                    <input class="form-check-input rename-compressed-check" type="checkbox"
+                           id="rename-check-${index}" data-index="${index}" checked>
+                    <label class="form-check-label small text-muted" for="rename-check-${index}">
+                        ✏️ Garder le nom original (renommer <code>_compressed.mp4</code> après mise à la corbeille)
+                    </label>
                 </div>
                 
                 <div class="compression-status mt-3 d-none">
@@ -401,15 +628,27 @@ async function batchCompress() {
             if (result && result.output_path) {
                 videosData[index].is_already_compressed = true;
                 videosData[index].compressed_path = result.output_path;
+                videosData[index].compressed_size_gb = result.compressed_size_gb;
+                videosData[index].reduction_percent = result.reduction_percent;
 
                 const compressedPathItem = cardElement.querySelector('.compressed-path-item');
                 const compressedPathDisplay = compressedPathItem.querySelector('.path-display');
                 compressedPathDisplay.textContent = result.output_path;
                 compressedPathItem.classList.remove('d-none');
 
+                const compressedLabelEl = compressedPathItem.querySelector('.compressed-path-label');
+                if (compressedLabelEl && result.compressed_size_gb != null) {
+                    compressedLabelEl.textContent = `📦 Fichier compressé (${result.compressed_size_gb} GB • -${result.reduction_percent ?? 0}%) :`;
+                }
+
                 const deleteBtn = cardElement.querySelector('.delete-btn');
                 deleteBtn.classList.remove('d-none');
                 deleteBtn.dataset.index = index;
+
+                const renameWrap = cardElement.querySelector('.rename-compressed-wrap');
+                if (renameWrap) {
+                    renameWrap.classList.remove('d-none');
+                }
 
                 const playCompressedBtn = cardElement.querySelector('.play-compressed-btn');
                 if (playCompressedBtn) {
@@ -592,6 +831,8 @@ async function compressVideo(index, cardElement) {
 
         videosData[index].is_already_compressed = true;
         videosData[index].compressed_path = data.output_path;
+        videosData[index].compressed_size_gb = data.compressed_size_gb;
+        videosData[index].reduction_percent = data.reduction_percent;
 
         // Décocher la checkbox et mettre à jour le label
         const checkbox = cardElement.querySelector('.video-checkbox');
@@ -605,9 +846,19 @@ async function compressVideo(index, cardElement) {
         compressedPathDisplay.textContent = data.output_path;
         compressedPathItem.classList.remove('d-none');
 
+        const compressedLabelEl = compressedPathItem.querySelector('.compressed-path-label');
+        if (compressedLabelEl && data.compressed_size_gb != null) {
+            compressedLabelEl.textContent = `📦 Fichier compressé (${data.compressed_size_gb} GB • -${data.reduction_percent ?? 0}%) :`;
+        }
+
         const deleteBtn = cardElement.querySelector('.delete-btn');
         deleteBtn.classList.remove('d-none');
         deleteBtn.dataset.index = index;
+
+        const renameWrap = cardElement.querySelector('.rename-compressed-wrap');
+        if (renameWrap) {
+            renameWrap.classList.remove('d-none');
+        }
 
         // Afficher le bouton de lecture du fichier compressé
         const playCompressedBtn = cardElement.querySelector('.play-compressed-btn');
@@ -664,14 +915,18 @@ async function playVideo(filePath, type) {
     }
 }
 
-async function confirmRecycleBinDialog(video) {
+async function confirmRecycleBinDialog(video, renameCompressed = false) {
+    const renameNote = renameCompressed
+        ? `✏️ Le fichier "_compressed.mp4" sera automatiquement renommé en "${video.name}".\n`
+        : '';
     const promptText =
         `⚠️ ATTENTION ⚠️\n\n` +
         `Vous êtes sur le point d'envoyer à la CORBEILLE le fichier original :\n\n` +
         `Nom du fichier : ${video.name}\n` +
         `Taille : ${video.size_gb} GB\n` +
         `Chemin complet :\n${video.path}\n\n` +
-        `⚠️ Le fichier sera dans la corbeille Windows (récupérable).\n\n` +
+        `⚠️ Le fichier sera dans la corbeille Windows (récupérable).\n` +
+        renameNote + `\n` +
         `Voulez-vous vraiment envoyer ce fichier à la corbeille ?`;
 
     try {
@@ -688,8 +943,10 @@ async function confirmRecycleBinDialog(video) {
 
 async function deleteOriginalFile(index, cardElement) {
     const video = videosData[index];
+    const renameCheck = cardElement.querySelector('.rename-compressed-check');
+    const renameCompressed = renameCheck ? renameCheck.checked : false;
 
-    const confirmed = await confirmRecycleBinDialog(video);
+    const confirmed = await confirmRecycleBinDialog(video, renameCompressed);
     if (!confirmed) {
         return;
     }
@@ -700,27 +957,50 @@ async function deleteOriginalFile(index, cardElement) {
     deleteBtn.textContent = '⏳ Suppression...';
 
     try {
-        await invoke('delete_file', { filePath: video.path });
+        const res = await invoke('delete_file', {
+            filePath: video.path,
+            renameCompressed,
+        });
 
         deleteBtn.textContent = '✅ Supprimé';
         deleteBtn.classList.remove('btn-danger');
         deleteBtn.classList.add('btn-secondary');
+
+        const renameWrap = cardElement.querySelector('.rename-compressed-wrap');
+        if (renameWrap) {
+            renameWrap.classList.add('d-none');
+        }
+
+        const renamedPath = res?.renamed_to || null;
+        if (renamedPath) {
+            videosData[index].compressed_path = renamedPath;
+            const compPathDisplay = cardElement.querySelector('.compressed-path-item .path-display');
+            if (compPathDisplay) {
+                compPathDisplay.textContent = renamedPath;
+            }
+        }
 
         // Marquer la carte comme supprimée
         const card = cardElement.querySelector('.card');
         card.style.opacity = '0.6';
 
         // Afficher un message
-        const resultDiv = cardElement.querySelector('.compression-result');
-        resultDiv.innerHTML = `
-            <h6 class="text-success">✅ Fichier original supprimé</h6>
-            <p class="mb-0">Le fichier original de ${video.size_gb} GB a été envoyé à la corbeille avec succès.</p>
-        `;
-        resultDiv.classList.remove('d-none');
-        resultDiv.classList.remove('compression-result');
-        resultDiv.classList.add('alert', 'alert-success');
+        const resultDiv = cardElement.querySelector('.compression-result') || cardElement.querySelector('.alert-success');
+        if (resultDiv) {
+            resultDiv.innerHTML = renamedPath
+                ? `<h6 class="text-success">✅ Fichier original supprimé & compressé renommé</h6>
+                   <p class="mb-0">Le fichier original (${video.size_gb} GB) a été envoyé à la corbeille et le fichier compressé a été renommé en <strong>${escapeHtml(video.name)}</strong>.</p>`
+                : `<h6 class="text-success">✅ Fichier original supprimé</h6>
+                   <p class="mb-0">Le fichier original de ${video.size_gb} GB a été envoyé à la corbeille avec succès.</p>`;
+            resultDiv.classList.remove('d-none');
+            resultDiv.classList.remove('compression-result');
+            resultDiv.classList.add('alert', 'alert-success');
+        }
 
-        alert(`✅ Fichier envoyé à la corbeille !\n\nVous avez libéré ${video.size_gb} GB d'espace disque.`);
+        const alertSuffix = renamedPath
+            ? `\n✏️ Le fichier compressé a été renommé en « ${video.name} ».`
+            : '';
+        alert(`✅ Fichier envoyé à la corbeille !\n\nVous avez libéré ${video.size_gb} GB d'espace disque.${alertSuffix}`);
     } catch (error) {
         console.error('Erreur:', error);
         deleteBtn.textContent = originalText;
@@ -830,6 +1110,9 @@ function openBatchDeleteModal() {
 
 async function executeBatchDelete(selectedIndices) {
     const confirmBtn = document.getElementById('batchDeleteConfirmBtn');
+    const renameCheck = document.getElementById('batchRenameCompressedCheck');
+    const renameCompressed = renameCheck ? renameCheck.checked : false;
+
     confirmBtn.disabled = true;
     confirmBtn.textContent = '⏳ Suppression en cours...';
 
@@ -839,7 +1122,10 @@ async function executeBatchDelete(selectedIndices) {
         .map(v => v.path);
 
     try {
-        const data = await invoke('delete_batch', { filePaths });
+        const data = await invoke('delete_batch', {
+            filePaths,
+            renameCompressed,
+        });
 
         const modalEl = document.getElementById('batchDeleteModal');
         const modalInstance = bootstrap.Modal.getInstance(modalEl);
@@ -864,11 +1150,27 @@ async function executeBatchDelete(selectedIndices) {
                 deleteBtn.classList.add('btn-secondary');
             }
 
+            const renameWrap = cardElement.querySelector('.rename-compressed-wrap');
+            if (renameWrap) {
+                renameWrap.classList.add('d-none');
+            }
+
+            if (result.renamed_to) {
+                videosData[idx].compressed_path = result.renamed_to;
+                const compPathDisplay = cardElement.querySelector('.compressed-path-item .path-display');
+                if (compPathDisplay) {
+                    compPathDisplay.textContent = result.renamed_to;
+                }
+            }
+
             const resultDiv = cardElement.querySelector('.compression-result');
             if (resultDiv) {
+                const renameBadge = result.renamed_to
+                    ? ` • Compressé renommé en <strong>${escapeHtml(videosData[idx].name)}</strong>`
+                    : '';
                 resultDiv.innerHTML = `
                     <div class="alert alert-success mt-2 mb-0">
-                        ✅ Fichier original supprimé (${videosData[idx].size_gb} GB libérés)
+                        ✅ Fichier original supprimé (${videosData[idx].size_gb} GB libérés)${renameBadge}
                     </div>`;
                 resultDiv.classList.remove('d-none');
             }

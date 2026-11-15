@@ -53,6 +53,11 @@ jobs:
             Copy-Item -Force $ffprobeExe.FullName $ffprobeTarget
           }
 
+      - name: Run TNR suite (Frontend build + Rust unit & E2E tests)
+        run: |
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Build and publish Tauri v2 NSIS installer & updater artifacts
         uses: tauri-apps/tauri-action@v0
         env:

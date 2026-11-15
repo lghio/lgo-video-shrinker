@@ -52,11 +52,15 @@
 
         <div class="row mb-4">
             <div class="col-12">
-                <div class="card">
+                <div class="card directory-drop-zone" id="directoryDropZone">
                     <div class="card-body">
-                        <label for="scanDirectory" class="form-label fw-bold">📂 Répertoire à scanner :</label>
+                        <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-1">
+                            <label for="scanDirectory" class="form-label fw-bold mb-0">📂 Répertoire à scanner :</label>
+                            <small class="text-muted drag-drop-hint">📥 Glissez-déposez un dossier ici ou utilisez Parcourir…</small>
+                        </div>
                         <div class="input-group mb-2">
                             <input type="text" id="scanDirectory" class="form-control" 
+                                   list="recentDirectoriesList"
                                    value="" 
                                    placeholder="Entrez le chemin du répertoire à scanner">
                             <button class="btn btn-outline-secondary" type="button" id="browseDirectoryBtn" title="Choisir un dossier">
@@ -64,7 +68,9 @@
                                 <span id="browseText">📁 Parcourir…</span>
                             </button>
                         </div>
-                        <small class="text-muted">Entrez le chemin complet du répertoire ou utilisez le bouton pour le choisir.</small>
+                        <datalist id="recentDirectoriesList"></datalist>
+                        <div id="recentDirsContainer" class="recent-dirs-container d-none mb-2"></div>
+                        <small class="text-muted">Entrez le chemin complet du répertoire, cliquez sur un dossier récent ou glissez-déposez un dossier dans la fenêtre.</small>
                     </div>
                 </div>
             </div>
@@ -111,12 +117,26 @@
 
         <div id="batchActions" class="card mb-4 d-none">
             <div class="card-body">
-                <div class="d-flex justify-content-between align-items-center">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
                     <div>
                         <h6 class="mb-1">Actions groupées</h6>
                         <p class="mb-0 text-muted"><span id="selectedCount">0</span> vidéo(s) sélectionnée(s)</p>
                     </div>
-                    <div class="d-flex gap-2">
+                    <div class="d-flex align-items-center gap-2 flex-wrap">
+                        <span class="fw-bold small text-secondary">Qualité globale :</span>
+                        <div class="batch-quality-selector" role="group" aria-label="Qualité globale">
+                            <button type="button" class="batch-quality-btn" data-quality="low" title="Appliquer la qualité Rapide (480p)">
+                                🏃 Rapide
+                            </button>
+                            <button type="button" class="batch-quality-btn active" data-quality="medium" title="Appliquer la qualité Équilibré (720p)">
+                                ⚖️ Équilibré
+                            </button>
+                            <button type="button" class="batch-quality-btn" data-quality="high" title="Appliquer la qualité Lent (résolution originale)">
+                                🎯 Lent
+                            </button>
+                        </div>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
                         <button id="selectAllBtn" class="btn btn-outline-primary">✓ Tout sélectionner</button>
                         <button id="deselectAllBtn" class="btn btn-outline-secondary">✗ Tout désélectionner</button>
                         <button id="batchCompressBtn" class="btn btn-success btn-lg">
@@ -181,6 +201,12 @@
                     </div>
                     <div id="batchDeleteSkipNotice"></div>
                     <ul id="batchDeleteFileList" class="list-group mb-3"></ul>
+                    <div class="form-check mb-3 p-3 bg-light rounded border">
+                        <input class="form-check-input" type="checkbox" id="batchRenameCompressedCheck" checked>
+                        <label class="form-check-label fw-semibold text-dark" for="batchRenameCompressedCheck">
+                            ✏️ Renommer automatiquement le fichier "_compressed.mp4" avec le nom original après envoi à la corbeille
+                        </label>
+                    </div>
                     <p class="text-muted mb-0" id="batchDeleteSummary"></p>
                 </div>
                 <div class="modal-footer">

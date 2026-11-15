@@ -266,6 +266,87 @@ header code {
     border-radius: 8px;
 }
 
+/* Sélecteur de qualité global dans la barre d'actions par lots */
+.batch-quality-selector {
+    display: inline-flex;
+    gap: 0.35rem;
+    background: rgba(255, 255, 255, 0.75);
+    padding: 0.25rem;
+    border-radius: 10px;
+    border: 1px solid #dee2e6;
+}
+
+.batch-quality-btn {
+    padding: 0.35rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    border: 1px solid transparent;
+    background: transparent;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    color: #495057;
+}
+
+.batch-quality-btn:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+.batch-quality-btn.active {
+    background: var(--primary-color);
+    color: #ffffff;
+    border-color: var(--primary-color);
+    box-shadow: 0 2px 6px rgba(52, 152, 219, 0.35);
+}
+
+/* Zone Drag & Drop répertoire & dossiers récents */
+.directory-drop-zone {
+    border: 2px dashed transparent;
+    transition: transform 0.3s ease, border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.directory-drop-zone.drag-over {
+    border-color: var(--primary-color);
+    background-color: #f0f8ff;
+    transform: scale(1.01);
+}
+
+.recent-dirs-container {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.recent-dirs-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #6c757d;
+    margin-right: 0.15rem;
+}
+
+.recent-dir-chip {
+    font-size: 0.76rem;
+    padding: 0.18rem 0.6rem;
+    border-radius: 14px;
+    border: 1px solid #ced4da;
+    background: #f8f9fa;
+    color: #495057;
+    cursor: pointer;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+}
+
+.recent-dir-chip:hover {
+    background: var(--primary-color);
+    color: #ffffff;
+    border-color: var(--primary-color);
+}
+
 /* Styles pour les chemins de fichiers */
 .file-paths {
     background: #f8f9fa;
