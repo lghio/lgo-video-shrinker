@@ -32,6 +32,32 @@ header code {
     font-size: 0.85rem;
 }
 
+/* Barre de menu supérieure */
+.top-menu-bar {
+    background: rgba(15, 23, 42, 0.35);
+    padding: 0.45rem 0.85rem;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    backdrop-filter: blur(6px);
+}
+
+.top-menu-btn {
+    background: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 18px;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.75rem;
+    font-weight: 500;
+}
+
+.top-menu-btn:hover,
+.top-menu-btn:focus {
+    background: rgba(255, 255, 255, 0.28);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.55);
+}
+
 /* Badges d'en-tête (version, encodeur matériel, bouton mise à jour) */
 .header-meta {
     margin-top: 0.35rem;
@@ -46,6 +72,70 @@ header code {
     border-radius: 20px;
     border: 1px solid rgba(255, 255, 255, 0.3);
     backdrop-filter: blur(4px);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.header-badge:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
+}
+
+.header-badge-rtx {
+    background: linear-gradient(135deg, #1b8a00 0%, #76b900 100%) !important;
+    color: #ffffff !important;
+    font-weight: 700;
+    border: 1px solid rgba(255, 255, 255, 0.65);
+    box-shadow: 0 0 14px rgba(118, 185, 0, 0.55);
+}
+
+/* Modales À propos & Changelog */
+.about-modal-header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.gpu-info-card {
+    border: 1px solid rgba(118, 185, 0, 0.4) !important;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08) !important;
+}
+
+.gpu-info-card:hover,
+.lifetime-info-card:hover {
+    transform: none;
+}
+
+.lifetime-info-card {
+    border: 1px solid rgba(46, 204, 113, 0.4) !important;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06) !important;
+}
+
+.lifetime-stats-banner {
+    font-size: 0.85rem;
+}
+
+.changelog-timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.changelog-entry-card {
+    border-left: 4px solid #667eea;
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    transition: background-color 0.15s ease;
+}
+
+.changelog-entry-card:hover {
+    background: #f1f4f9;
+}
+
+.changelog-entry-card code {
+    background: rgba(102, 126, 234, 0.12);
+    color: #3b4990;
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.82rem;
 }
 
 .header-update-btn {
@@ -223,7 +313,59 @@ header code {
 }
 
 #scanBtn {
-    width: 100%;
+    min-width: 220px;
+}
+
+/* Barre de progression du scan parallèle */
+#scanProgressContainer {
+    background: rgba(15, 23, 42, 0.4);
+    padding: 0.75rem 1rem;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    backdrop-filter: blur(6px);
+}
+
+.scan-progress {
+    height: 22px;
+    border-radius: 11px;
+}
+
+.scan-progress .progress-bar {
+    font-size: 0.8rem;
+}
+
+/* Badges OneDrive Cloud-only & Bas Bitrate sur les cartes vidéo */
+.video-status-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.35rem;
+}
+
+.badge-cloud-only {
+    background: rgba(13, 202, 240, 0.22);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    font-weight: 600;
+    font-size: 0.76rem;
+    padding: 0.28rem 0.6rem;
+    border-radius: 12px;
+}
+
+.badge-low-bitrate {
+    background: rgba(255, 193, 7, 0.28);
+    color: #fff8db;
+    border: 1px solid rgba(255, 224, 130, 0.7);
+    font-weight: 600;
+    font-size: 0.76rem;
+    padding: 0.28rem 0.6rem;
+    border-radius: 12px;
+}
+
+.compression-result.smart-skip-result {
+    background: #fff3cd;
+    border-color: #ffecb5;
+    color: #664d03;
 }
 
 .spinner-border-sm {
@@ -264,6 +406,30 @@ header code {
     background: white;
     padding: 1rem;
     border-radius: 8px;
+}
+
+#batchSummaryBanner {
+    font-weight: 500;
+    border-left: 4px solid var(--success-color);
+}
+
+/* Barre d'outils de recherche, filtre par statut et tri */
+#filterToolbar:hover {
+    transform: none;
+}
+
+#filterToolbar .form-select-sm,
+#filterToolbar .form-control {
+    border-radius: 8px;
+}
+
+#clearSearchBtn {
+    padding: 0.35rem 0.75rem;
+}
+
+#visibleVideosCount {
+    font-size: 0.82rem;
+    font-weight: 600;
 }
 
 /* Sélecteur de qualité global dans la barre d'actions par lots */

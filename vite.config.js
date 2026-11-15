@@ -11,7 +11,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../dist-frontend',
+    outDir: '../src-tauri/target/frontend-dist',
     emptyOutDir: true,
     target: 'esnext',
   },

@@ -4,21 +4,30 @@ import '../css/style.css';
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow, ProgressBarStatus, UserAttentionType } from '@tauri-apps/api/window';
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
-import { initUpdater } from './updater.js';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { initUpdater, checkForAppUpdates } from './updater.js';
 
 const STORAGE_LAST_DIR = 'lastScanDirectory';
 const STORAGE_RECENT_DIRS = 'recentScanDirectories';
 const STORAGE_LAST_MIN_SIZE = 'lastMinSizeGb';
+const STORAGE_SELECTED_CODEC = 'selectedVideoCodec';
+const STORAGE_LIFETIME_STATS = 'lifetimeCompressionStats';
+const SUPPORTED_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.mkv', '.avi', '.webm'];
 const MAX_RECENT_DIRS = 5;
 
 let videosData = [];
 let activeCompressions = {}; // { [videoIndex]: { unlisten: Function, cancel: Function } }
 let batchCancelled = false;  // Flag pour arrêter la compression par lots
+let isBatchRunning = false;  // Indique si une compression par lots est en cours
 let currentBatchQuality = 'medium';
+let currentVideoCodec = 'h264';
+let currentAppInfo = null;
 
 document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('scanBtn')?.addEventListener('click', scanVideos);
+    document.getElementById('cancelScanBtn')?.addEventListener('click', cancelScan);
     document.getElementById('selectAllBtn')?.addEventListener('click', selectAll);
     document.getElementById('deselectAllBtn')?.addEventListener('click', deselectAll);
     document.getElementById('batchCompressBtn')?.addEventListener('click', batchCompress);
@@ -27,6 +36,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('logClearBtn')?.addEventListener('click', clearLogs);
     document.getElementById('logToggleBtn')?.addEventListener('click', toggleLogPanel);
     document.getElementById('browseDirectoryBtn')?.addEventListener('click', browseDirectory);
+
+    // Boutons Menu, À propos, Changelog & Détection GPU RTX
+    document.getElementById('menuAboutBtn')?.addEventListener('click', openAboutModal);
+    document.getElementById('dropdownAboutBtn')?.addEventListener('click', openAboutModal);
+    document.getElementById('hwEncoderBadge')?.addEventListener('click', openAboutModal);
+    document.getElementById('appVersionBadge')?.addEventListener('click', openAboutModal);
+
+    document.getElementById('menuChangelogBtn')?.addEventListener('click', openChangelogModal);
+    document.getElementById('dropdownChangelogBtn')?.addEventListener('click', openChangelogModal);
+    document.getElementById('aboutOpenChangelogBtn')?.addEventListener('click', () => {
+        const aboutEl = document.getElementById('aboutModal');
+        const aboutInstance = aboutEl ? bootstrap.Modal.getInstance(aboutEl) : null;
+        if (aboutInstance) aboutInstance.hide();
+        openChangelogModal();
+    });
+
+    document.getElementById('menuProbeGpuBtn')?.addEventListener('click', reprobeHardware);
+    document.getElementById('dropdownProbeGpuBtn')?.addEventListener('click', reprobeHardware);
+    document.getElementById('reprobeGpuBtn')?.addEventListener('click', reprobeHardware);
+    document.getElementById('resetLifetimeStatsBtn')?.addEventListener('click', resetLifetimeStats);
+
+    document.getElementById('dropdownCheckUpdateBtn')?.addEventListener('click', () => {
+        checkForAppUpdates(true, appendLog);
+    });
+
+    document.getElementById('aboutRepoLink')?.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const url = 'https://github.com/lghio/lgo-video-shrinker';
+        try {
+            await openUrl(url);
+        } catch {
+            window.open(url, '_blank', 'noopener,noreferrer');
+        }
+    });
 
     const minSizeSelect = document.getElementById('minSize');
     if (minSizeSelect) {
@@ -42,13 +85,376 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    const codecSelect = document.getElementById('codecSelect');
+    if (codecSelect) {
+        const savedCodec = localStorage.getItem(STORAGE_SELECTED_CODEC);
+        if (savedCodec === 'h264' || savedCodec === 'hevc') {
+            codecSelect.value = savedCodec;
+            currentVideoCodec = savedCodec;
+        }
+        codecSelect.addEventListener('change', (e) => {
+            const selected = e.target.value === 'hevc' ? 'hevc' : 'h264';
+            currentVideoCodec = selected;
+            localStorage.setItem(STORAGE_SELECTED_CODEC, selected);
+        });
+    }
+
     initBatchQualitySelector();
+    initFilterToolbar();
+    renderLifetimeStats();
     await initDragAndDrop();
     await initLogListener();
+    await initScanProgressListener();
+    await initMenuListener();
     await loadAppInfo();
     initUpdater(appendLog);
     console.log('[Init] Tous les listeners Tauri enregistrés');
 });
+
+async function setTaskbarProgress(percentOrNull, status = ProgressBarStatus.Normal) {
+    try {
+        const win = getCurrentWindow();
+        if (percentOrNull === null || percentOrNull === undefined) {
+            await win.setProgressBar({ status: ProgressBarStatus.None, progress: 0 });
+        } else {
+            const clamped = Math.max(0, Math.min(100, Math.round(percentOrNull)));
+            await win.setProgressBar({ status, progress: clamped });
+        }
+    } catch {
+        // Ignorer si la plateforme ou le contexte WebView ne supporte pas setProgressBar
+    }
+}
+
+async function notifyBatchCompleted(summaryText) {
+    try {
+        await getCurrentWindow().requestUserAttention(UserAttentionType.Informational);
+    } catch {
+        // Ignorer si non supporté
+    }
+
+    try {
+        if ('Notification' in window) {
+            if (Notification.permission === 'granted') {
+                new Notification('VideoShrinker — Lot terminé', { body: summaryText });
+            } else if (Notification.permission !== 'denied') {
+                const perm = await Notification.requestPermission();
+                if (perm === 'granted') {
+                    new Notification('VideoShrinker — Lot terminé', { body: summaryText });
+                }
+            }
+        }
+    } catch {
+        // Ignorer si Notification API non disponible
+    }
+}
+
+function getLifetimeStats() {
+    const defaultStats = {
+        videosCount: 0,
+        bytesSaved: 0,
+        originalBytes: 0,
+        compressedBytes: 0,
+        lastUpdated: null,
+    };
+    try {
+        const raw = localStorage.getItem(STORAGE_LIFETIME_STATS);
+        if (!raw) return defaultStats;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return defaultStats;
+        return {
+            videosCount: Math.max(0, Number(parsed.videosCount) || 0),
+            bytesSaved: Math.max(0, Number(parsed.bytesSaved) || 0),
+            originalBytes: Math.max(0, Number(parsed.originalBytes) || 0),
+            compressedBytes: Math.max(0, Number(parsed.compressedBytes) || 0),
+            lastUpdated: typeof parsed.lastUpdated === 'string' ? parsed.lastUpdated : null,
+        };
+    } catch {
+        return defaultStats;
+    }
+}
+
+function recordLifetimeCompression(origSizeGb, compSizeGb) {
+    const origBytes = Math.max(0, Math.round((Number(origSizeGb) || 0) * 1073741824));
+    const compBytes = Math.max(0, Math.round((Number(compSizeGb) || 0) * 1073741824));
+    const savedBytes = origBytes - compBytes;
+    if (savedBytes <= 0) return;
+
+    const stats = getLifetimeStats();
+    stats.videosCount += 1;
+    stats.bytesSaved += savedBytes;
+    stats.originalBytes += origBytes;
+    stats.compressedBytes += compBytes;
+    stats.lastUpdated = new Date().toISOString();
+
+    try {
+        localStorage.setItem(STORAGE_LIFETIME_STATS, JSON.stringify(stats));
+    } catch {
+        // Ignorer en cas de quota localStorage atteint
+    }
+    renderLifetimeStats();
+}
+
+function renderLifetimeStats() {
+    const stats = getLifetimeStats();
+    const savedGb = (stats.bytesSaved / 1073741824).toFixed(2);
+    const reductionPct = stats.originalBytes > 0
+        ? ((stats.bytesSaved / stats.originalBytes) * 100).toFixed(1)
+        : '0.0';
+
+    const lifetimeSavedGbEl = document.getElementById('lifetimeSavedGb');
+    const lifetimeVideosCountEl = document.getElementById('lifetimeVideosCount');
+    if (lifetimeSavedGbEl) lifetimeSavedGbEl.textContent = `${savedGb} GB`;
+    if (lifetimeVideosCountEl) lifetimeVideosCountEl.textContent = String(stats.videosCount);
+
+    const aboutSavedGbEl = document.getElementById('aboutLifetimeSavedGb');
+    const aboutVideosCountEl = document.getElementById('aboutLifetimeVideosCount');
+    const aboutReductionPctEl = document.getElementById('aboutLifetimeReductionPct');
+    if (aboutSavedGbEl) aboutSavedGbEl.textContent = `${savedGb} GB`;
+    if (aboutVideosCountEl) aboutVideosCountEl.textContent = `${stats.videosCount} vidéo(s)`;
+    if (aboutReductionPctEl) aboutReductionPctEl.textContent = `-${reductionPct}%`;
+}
+
+function resetLifetimeStats() {
+    const emptyStats = {
+        videosCount: 0,
+        bytesSaved: 0,
+        originalBytes: 0,
+        compressedBytes: 0,
+        lastUpdated: null,
+    };
+    try {
+        localStorage.setItem(STORAGE_LIFETIME_STATS, JSON.stringify(emptyStats));
+    } catch {
+        // Ignorer
+    }
+    renderLifetimeStats();
+    appendLog('INFO', '[Stats] Historique cumulé des compressions réinitialisé.');
+}
+
+async function initScanProgressListener() {
+    try {
+        await listen('scan://progress', (event) => {
+            const data = event.payload;
+            if (!data) return;
+            const container = document.getElementById('scanProgressContainer');
+            const textEl = document.getElementById('scanProgressText');
+            const barEl = document.getElementById('scanProgressBar');
+
+            if (container) {
+                container.classList.remove('d-none');
+            }
+
+            const current = data.current ?? 0;
+            const total = data.total ?? 0;
+            const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+
+            if (textEl) {
+                const fileSuffix = data.current_file ? ` (${data.current_file})` : '';
+                textEl.textContent = `Analyse : ${current} / ${total} vidéos...${fileSuffix}`;
+            }
+            if (barEl) {
+                barEl.style.width = `${pct}%`;
+                barEl.textContent = `${pct}%`;
+                barEl.setAttribute('aria-valuenow', String(pct));
+            }
+        });
+    } catch (err) {
+        console.warn('Listener scan://progress non disponible:', err);
+    }
+}
+
+async function cancelScan() {
+    const cancelBtn = document.getElementById('cancelScanBtn');
+    const textEl = document.getElementById('scanProgressText');
+    if (cancelBtn) {
+        cancelBtn.disabled = true;
+    }
+    if (textEl) {
+        textEl.textContent = '⏹️ Arrêt du scan en cours...';
+    }
+    try {
+        await invoke('cancel_scan');
+    } catch (err) {
+        console.error('Erreur cancel_scan:', err);
+    }
+}
+
+function initFilterToolbar() {
+    const searchInput = document.getElementById('videoSearchInput');
+    const clearBtn = document.getElementById('clearSearchBtn');
+    const statusFilter = document.getElementById('videoStatusFilter');
+    const sortSelect = document.getElementById('videoSortSelect');
+
+    searchInput?.addEventListener('input', () => {
+        applyFiltersAndSort();
+    });
+
+    clearBtn?.addEventListener('click', () => {
+        if (searchInput) {
+            searchInput.value = '';
+            applyFiltersAndSort();
+            searchInput.focus();
+        }
+    });
+
+    statusFilter?.addEventListener('change', () => {
+        applyFiltersAndSort();
+    });
+
+    sortSelect?.addEventListener('change', () => {
+        applyFiltersAndSort();
+    });
+}
+
+function normalizeSearchString(str) {
+    return String(str || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+}
+
+function applyFiltersAndSort() {
+    const videoList = document.getElementById('videoList');
+    if (!videoList) return;
+
+    const cardCols = Array.from(videoList.querySelectorAll('.col[data-video-index]'));
+    const countBadge = document.getElementById('visibleVideosCount');
+
+    if (cardCols.length === 0) {
+        if (countBadge) {
+            countBadge.textContent = 'Affichées : 0 / 0';
+        }
+        return;
+    }
+
+    const rawSearch = document.getElementById('videoSearchInput')?.value || '';
+    const searchQuery = normalizeSearchString(rawSearch.trim());
+    const statusFilter = document.getElementById('videoStatusFilter')?.value || 'all';
+    const sortSelect = document.getElementById('videoSortSelect')?.value || 'size_desc';
+
+    const items = cardCols.map(col => {
+        const idx = parseInt(col.dataset.videoIndex, 10);
+        return {
+            col,
+            idx,
+            video: videosData[idx] || {},
+        };
+    });
+
+    items.sort((a, b) => {
+        const va = a.video;
+        const vb = b.video;
+        switch (sortSelect) {
+            case 'size_asc':
+                return (va.size_gb || 0) - (vb.size_gb || 0);
+            case 'duration_desc':
+                return (vb.duration || 0) - (va.duration || 0);
+            case 'duration_asc':
+                return (va.duration || 0) - (vb.duration || 0);
+            case 'bitrate_desc':
+                return (vb.bitrate || 0) - (va.bitrate || 0);
+            case 'name_asc':
+                return String(va.name || '').localeCompare(String(vb.name || ''), 'fr', {
+                    sensitivity: 'base',
+                    numeric: true,
+                });
+            case 'size_desc':
+            default:
+                return (vb.size_gb || 0) - (va.size_gb || 0);
+        }
+    });
+
+    let visibleCount = 0;
+
+    items.forEach(({ col, video }) => {
+        const isCompressed = Boolean(video.is_already_compressed);
+        let statusMatch = true;
+        if (statusFilter === 'to_compress') {
+            statusMatch = !isCompressed;
+        } else if (statusFilter === 'compressed') {
+            statusMatch = isCompressed;
+        }
+
+        let searchMatch = true;
+        if (searchQuery) {
+            const normName = normalizeSearchString(video.name);
+            const normRelPath = normalizeSearchString(video.relative_path);
+            searchMatch = normName.includes(searchQuery) || normRelPath.includes(searchQuery);
+        }
+
+        const isVisible = statusMatch && searchMatch;
+        col.classList.toggle('d-none', !isVisible);
+        if (isVisible) {
+            visibleCount++;
+        }
+
+        videoList.appendChild(col);
+    });
+
+    let noMatchEl = document.getElementById('noFilterMatchAlert');
+    if (visibleCount === 0 && videosData.length > 0) {
+        if (!noMatchEl) {
+            noMatchEl = document.createElement('div');
+            noMatchEl.id = 'noFilterMatchAlert';
+            noMatchEl.className = 'col-12';
+            noMatchEl.innerHTML =
+                '<div class="alert alert-warning mb-0">🔍 Aucune vidéo ne correspond aux critères de recherche ou de filtre.</div>';
+        }
+        noMatchEl.classList.remove('d-none');
+        videoList.appendChild(noMatchEl);
+    } else if (noMatchEl) {
+        noMatchEl.classList.add('d-none');
+    }
+
+    if (countBadge) {
+        countBadge.textContent = `Affichées : ${visibleCount} / ${videosData.length}`;
+    }
+}
+
+function updateGlobalStats() {
+    const statsCard = document.getElementById('statsCard');
+    const videoCountEl = document.getElementById('videoCount');
+    const totalSizeEl = document.getElementById('totalSize');
+    const savingEl = document.getElementById('potentialSaving');
+    const savingLabelEl = document.getElementById('potentialSavingLabel');
+
+    const count = videosData.length;
+    const totalSizeGb = videosData.reduce((sum, v) => sum + (v.size_gb || 0), 0);
+
+    let compressedCount = 0;
+    let realSavedGb = 0;
+    let remainingPotentialGb = 0;
+
+    videosData.forEach(v => {
+        const origGb = v.size_gb || 0;
+        if (v.is_already_compressed && v.compressed_size_gb != null) {
+            compressedCount++;
+            realSavedGb += Math.max(0, origGb - v.compressed_size_gb);
+        } else {
+            remainingPotentialGb += origGb * 0.5;
+        }
+    });
+
+    if (statsCard) statsCard.classList.remove('d-none');
+    if (videoCountEl) videoCountEl.textContent = String(count);
+    if (totalSizeEl) totalSizeEl.textContent = `${totalSizeGb.toFixed(2)} GB`;
+
+    if (savingEl) {
+        if (compressedCount > 0) {
+            savingEl.textContent = `${realSavedGb.toFixed(2)} GB`;
+            if (savingLabelEl) {
+                savingLabelEl.textContent = remainingPotentialGb > 0
+                    ? `Économie réelle (${compressedCount}/${count}) • +~${remainingPotentialGb.toFixed(2)} GB potentiel`
+                    : `Économie réelle réalisée (${compressedCount}/${count})`;
+            }
+        } else {
+            savingEl.textContent = `~${(totalSizeGb * 0.5).toFixed(2)} GB`;
+            if (savingLabelEl) {
+                savingLabelEl.textContent = 'Économie potentielle (50%)';
+            }
+        }
+    }
+}
 
 function getRecentDirectories() {
     try {
@@ -149,10 +555,10 @@ function initBatchQualitySelector() {
 
 function applyBatchQuality(quality) {
     currentBatchQuality = quality;
-    const checkedBoxes = document.querySelectorAll('.video-checkbox:checked');
+    const checkedBoxes = document.querySelectorAll('#videoList .col:not(.d-none) .video-checkbox:checked');
     const targetCards = checkedBoxes.length > 0
         ? Array.from(checkedBoxes).map(cb => cb.closest('.col')).filter(Boolean)
-        : Array.from(document.querySelectorAll('#videoList .col'));
+        : Array.from(document.querySelectorAll('#videoList .col:not(.d-none)'));
 
     targetCards.forEach(cardCol => {
         const qualityBtns = cardCol.querySelectorAll('.quality-btn');
@@ -170,8 +576,9 @@ async function initDragAndDrop() {
         let targetDir = rawPath.trim();
         if (!targetDir) return;
 
-        // Si un fichier .mp4 est déposé, utiliser son dossier parent
-        if (targetDir.toLowerCase().endsWith('.mp4')) {
+        // Si un fichier vidéo supporté (.mp4, .mov, .mkv, .avi, .webm) est déposé, utiliser son dossier parent
+        const lowerTarget = targetDir.toLowerCase();
+        if (SUPPORTED_VIDEO_EXTENSIONS.some(ext => lowerTarget.endsWith(ext))) {
             targetDir = targetDir.replace(/[/\\][^/\\]+$/, '');
         }
         if (!targetDir) return;
@@ -232,6 +639,240 @@ async function initDragAndDrop() {
     }
 }
 
+async function initMenuListener() {
+    try {
+        await listen('menu://action', (event) => {
+            const action = event.payload;
+            if (action === 'about') {
+                openAboutModal();
+            } else if (action === 'changelog') {
+                openChangelogModal();
+            } else if (action === 'probe_gpu') {
+                reprobeHardware();
+            }
+        });
+    } catch (err) {
+        console.warn('Listener menu://action non disponible:', err);
+    }
+}
+
+function openAboutModal() {
+    const modalEl = document.getElementById('aboutModal');
+    if (!modalEl) return;
+    renderLifetimeStats();
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+    modal.show();
+}
+
+function openChangelogModal() {
+    const modalEl = document.getElementById('changelogModal');
+    if (!modalEl) return;
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+    modal.show();
+}
+
+function formatInlineMarkdown(rawText) {
+    let html = escapeHtml(rawText);
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    return html;
+}
+
+function renderChangelog(markdown) {
+    const container = document.getElementById('changelogContainer');
+    if (!container) return;
+
+    if (!markdown || typeof markdown !== 'string') {
+        container.innerHTML = '<div class="alert alert-secondary mb-0">Aucune entrée de changelog disponible.</div>';
+        return;
+    }
+
+    const lines = markdown.split(/\r?\n/);
+    const entries = [];
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) continue;
+        const cells = trimmed
+            .slice(1, -1)
+            .split('|')
+            .map(c => c.trim());
+        if (cells.length < 2) continue;
+        const [dateCol, summaryCol] = cells;
+        if (
+            dateCol.toLowerCase() === 'date' ||
+            /^[-:\s]+$/.test(dateCol) ||
+            /^[-:\s]+$/.test(summaryCol)
+        ) {
+            continue;
+        }
+        entries.push({ date: dateCol, summary: summaryCol });
+    }
+
+    if (entries.length === 0) {
+        container.innerHTML = `<pre class="small mb-0">${escapeHtml(markdown)}</pre>`;
+        return;
+    }
+
+    container.innerHTML = entries
+        .map((entry, idx) => {
+            const versionMatch = entry.summary.match(/\bv\d+\.\d+\.\d+\b/);
+            const versionBadge = versionMatch
+                ? `<span class="badge bg-primary">${escapeHtml(versionMatch[0])}</span>`
+                : idx === 0
+                ? `<span class="badge bg-success">Dernière mise à jour</span>`
+                : '';
+
+            const typeMatch = entry.summary.match(/^([a-z]+)(\([^)]+\))?:\s*/i);
+            let categoryBadge = '';
+            let bodyText = entry.summary;
+            if (typeMatch) {
+                const commitType = typeMatch[1].toLowerCase();
+                const scope = typeMatch[2] ? typeMatch[2] : '';
+                const badgeColor =
+                    commitType === 'feat'
+                        ? 'bg-success'
+                        : commitType === 'fix'
+                        ? 'bg-warning text-dark'
+                        : commitType === 'chore'
+                        ? 'bg-info text-dark'
+                        : 'bg-secondary';
+                categoryBadge = `<span class="badge ${badgeColor} font-monospace">${escapeHtml(commitType + scope)}</span>`;
+                bodyText = entry.summary.slice(typeMatch[0].length);
+            }
+
+            return `
+                <div class="changelog-entry-card">
+                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+                        <div class="d-flex align-items-center gap-2">
+                            <span class="badge bg-dark">📅 ${escapeHtml(entry.date)}</span>
+                            ${versionBadge}
+                            ${categoryBadge}
+                        </div>
+                    </div>
+                    <div class="small text-dark">${formatInlineMarkdown(bodyText)}</div>
+                </div>
+            `;
+        })
+        .join('');
+}
+
+function applyAppInfoToUi(info) {
+    if (!info) return;
+    currentAppInfo = info;
+
+    const versionBadge = document.getElementById('appVersionBadge');
+    if (versionBadge && info.version) {
+        versionBadge.textContent = `v${info.version}`;
+    }
+    const aboutVersionBadge = document.getElementById('aboutVersionBadge');
+    if (aboutVersionBadge && info.version) {
+        aboutVersionBadge.textContent = `v${info.version}`;
+    }
+
+    const hwBadge = document.getElementById('hwEncoderBadge');
+    const hevcEncoder = info.hw_encoder_hevc || 'libx265';
+    if (hwBadge && info.hw_encoder) {
+        if (info.is_rtx) {
+            const gpuLabel = info.gpu_name || 'NVIDIA RTX';
+            hwBadge.textContent = `🟢 RTX NVENC : ${gpuLabel} (${info.hw_encoder} / ${hevcEncoder})`;
+            hwBadge.classList.add('header-badge-rtx');
+        } else {
+            hwBadge.classList.remove('header-badge-rtx');
+            if (info.gpu_name && info.hw_encoder !== 'libx264') {
+                hwBadge.textContent = `⚡ Encodeur : ${info.hw_encoder} / ${hevcEncoder} (${info.gpu_name})`;
+            } else {
+                hwBadge.textContent = `⚡ Encodeur : ${info.hw_encoder} / ${hevcEncoder}`;
+            }
+        }
+    }
+
+    const aboutGpuName = document.getElementById('aboutGpuName');
+    if (aboutGpuName) {
+        aboutGpuName.textContent = info.gpu_name || 'Aucun GPU dédié détecté (CPU uniquement)';
+    }
+
+    const aboutRtxStatus = document.getElementById('aboutRtxStatus');
+    if (aboutRtxStatus) {
+        if (info.is_rtx) {
+            aboutRtxStatus.innerHTML =
+                '<span class="badge bg-success">🟢 NVIDIA RTX — Moteur NVENC avancé actif (H.264 &amp; HEVC)</span>';
+        } else if (info.hw_encoder && info.hw_encoder !== 'libx264') {
+            aboutRtxStatus.innerHTML = `<span class="badge bg-info text-dark">⚡ Accélération matérielle (${escapeHtml(info.hw_encoder)} / ${escapeHtml(hevcEncoder)})</span>`;
+        } else {
+            aboutRtxStatus.innerHTML =
+                '<span class="badge bg-secondary">💻 Encodage logiciel CPU (libx264 / libx265)</span>';
+        }
+    }
+
+    const aboutEncoderName = document.getElementById('aboutEncoderName');
+    if (aboutEncoderName) {
+        aboutEncoderName.textContent = `${info.hw_encoder || 'libx264'} (H.264) / ${hevcEncoder} (HEVC)`;
+    }
+
+    const aboutEncoderPipeline = document.getElementById('aboutEncoderPipeline');
+    if (aboutEncoderPipeline) {
+        if (info.hw_encoder === 'h264_nvenc') {
+            aboutEncoderPipeline.textContent =
+                'Décodage matériel (-hwaccel auto) + NVENC VBR HQ (-tune hq -multipass qres) + Spatial/Temporal AQ (H.264 & HEVC hvc1)';
+        } else if (info.hw_encoder === 'h264_qsv') {
+            aboutEncoderPipeline.textContent =
+                'Accélération matérielle Intel QuickSync (-c:v h264_qsv / hevc_qsv -global_quality)';
+        } else if (info.hw_encoder === 'h264_amf') {
+            aboutEncoderPipeline.textContent =
+                'Accélération matérielle AMD AMF (-c:v h264_amf / hevc_amf -qp_i/-qp_p)';
+        } else {
+            aboutEncoderPipeline.textContent =
+                'Encodage logiciel CPU multi-thread (-c:v libx264 / libx265 -threads 0)';
+        }
+    }
+
+    if (info.changelog_markdown) {
+        renderChangelog(info.changelog_markdown);
+    }
+}
+
+async function reprobeHardware() {
+    const reprobeBtn = document.getElementById('reprobeGpuBtn');
+    const menuProbeBtn = document.getElementById('menuProbeGpuBtn');
+
+    if (reprobeBtn) {
+        reprobeBtn.disabled = true;
+        reprobeBtn.textContent = '⏳ Détection GPU en cours...';
+    }
+    if (menuProbeBtn) {
+        menuProbeBtn.disabled = true;
+    }
+
+    try {
+        appendLog('INFO', '[HW] Analyse de la carte graphique NVIDIA RTX et des encodeurs FFmpeg...');
+        const info = await invoke('probe_hardware');
+        applyAppInfoToUi(info);
+        if (info.is_rtx) {
+            appendLog(
+                'SUCCESS',
+                `[HW] Carte NVIDIA RTX confirmée : ${info.gpu_name} | Encodeur ${info.hw_encoder} (NVENC VBR HQ + Spatial/Temporal AQ actif)`
+            );
+        } else {
+            appendLog(
+                'INFO',
+                `[HW] Détection terminée : GPU=${info.gpu_name || 'N/A'} | Encodeur=${info.hw_encoder}`
+            );
+        }
+    } catch (error) {
+        console.error('Erreur probe_hardware:', error);
+        appendLog('ERROR', `[HW] Échec de la détection matérielle : ${error}`);
+    } finally {
+        if (reprobeBtn) {
+            reprobeBtn.disabled = false;
+            reprobeBtn.textContent = '🔍 Relancer la détection GPU / RTX';
+        }
+        if (menuProbeBtn) {
+            menuProbeBtn.disabled = false;
+        }
+    }
+}
+
 async function loadAppInfo() {
     try {
         const info = await invoke('get_app_info');
@@ -245,15 +886,19 @@ async function loadAppInfo() {
             }
         }
         renderRecentDirectories();
-        const versionBadge = document.getElementById('appVersionBadge');
-        if (versionBadge && info.version) {
-            versionBadge.textContent = `v${info.version}`;
+        applyAppInfoToUi(info);
+
+        if (info.is_rtx) {
+            appendLog(
+                'SUCCESS',
+                `[Init] VideoShrinker v${info.version} prêt | 🟢 GPU RTX détecté : ${info.gpu_name} (${info.hw_encoder} VBR HQ + AQ)`
+            );
+        } else {
+            appendLog(
+                'INFO',
+                `[Init] VideoShrinker v${info.version} prêt | Encodeur matériel : ${info.hw_encoder}${info.gpu_name ? ' (' + info.gpu_name + ')' : ''}`
+            );
         }
-        const hwBadge = document.getElementById('hwEncoderBadge');
-        if (hwBadge && info.hw_encoder) {
-            hwBadge.textContent = `⚡ Encodeur : ${info.hw_encoder}`;
-        }
-        appendLog('INFO', `[Init] VideoShrinker v${info.version} prêt | Encodeur matériel : ${info.hw_encoder}`);
     } catch (error) {
         console.error('Erreur get_app_info:', error);
         appendLog('ERROR', `[Init] Impossible de récupérer les informations de l'application : ${error}`);
@@ -303,6 +948,10 @@ async function scanVideos() {
     const text = document.getElementById('scanText');
     const minSize = document.getElementById('minSize').value;
     const directory = document.getElementById('scanDirectory').value.trim();
+    const scanProgressContainer = document.getElementById('scanProgressContainer');
+    const scanProgressText = document.getElementById('scanProgressText');
+    const scanProgressBar = document.getElementById('scanProgressBar');
+    const cancelScanBtn = document.getElementById('cancelScanBtn');
 
     if (!directory) {
         alert('Veuillez entrer un répertoire à scanner');
@@ -315,6 +964,21 @@ async function scanVideos() {
     spinner.classList.remove('d-none');
     text.textContent = ' Scan en cours...';
 
+    if (scanProgressContainer) {
+        scanProgressContainer.classList.remove('d-none');
+    }
+    if (scanProgressText) {
+        scanProgressText.textContent = 'Analyse : 0 / 0 vidéos...';
+    }
+    if (scanProgressBar) {
+        scanProgressBar.style.width = '0%';
+        scanProgressBar.textContent = '0%';
+        scanProgressBar.setAttribute('aria-valuenow', '0');
+    }
+    if (cancelScanBtn) {
+        cancelScanBtn.disabled = false;
+    }
+
     try {
         const data = await invoke('scan_videos', {
             directory,
@@ -323,11 +987,11 @@ async function scanVideos() {
 
         videosData = data.videos || [];
 
-        // Afficher les statistiques
-        document.getElementById('statsCard').classList.remove('d-none');
-        document.getElementById('videoCount').textContent = data.count ?? 0;
-        document.getElementById('totalSize').textContent = (data.total_size_gb ?? 0) + ' GB';
-        document.getElementById('potentialSaving').textContent = '~' + ((data.total_size_gb ?? 0) * 0.5).toFixed(2) + ' GB';
+        // Masquer l'ancien résumé de lot lors d'un nouveau scan
+        document.getElementById('batchSummaryBanner')?.classList.add('d-none');
+
+        // Afficher les statistiques globales
+        updateGlobalStats();
 
         // Afficher et mémoriser le répertoire scanné
         const scannedDir = data.scanned_directory || directory;
@@ -354,6 +1018,9 @@ async function scanVideos() {
     } finally {
         btn.disabled = false;
         spinner.classList.add('d-none');
+        if (scanProgressContainer) {
+            scanProgressContainer.classList.add('d-none');
+        }
         setTimeout(() => {
             text.textContent = '📁 Scanner à nouveau';
         }, 2000);
@@ -362,30 +1029,64 @@ async function scanVideos() {
 
 function displayVideos(videos) {
     const videoList = document.getElementById('videoList');
+    const filterToolbar = document.getElementById('filterToolbar');
     videoList.innerHTML = '';
 
     if (!videos || videos.length === 0) {
         videoList.innerHTML = '<div class="col"><div class="alert alert-info">Aucune vidéo trouvée.</div></div>';
         document.getElementById('batchActions').classList.add('d-none');
+        filterToolbar?.classList.add('d-none');
         return;
     }
+
+    filterToolbar?.classList.remove('d-none');
 
     videos.forEach((video, index) => {
         const card = createVideoCard(video, index);
         videoList.appendChild(card);
     });
+
+    applyFiltersAndSort();
 }
 
 function createVideoCard(video, index) {
     const col = document.createElement('div');
     col.className = 'col';
+    col.dataset.videoIndex = String(index);
 
-    const duration = video.duration ? formatDuration(video.duration) : 'N/A';
-    const resolution = video.resolution || 'N/A';
-    const bitrate = video.bitrate ? formatBitrate(video.bitrate) : 'N/A';
+    const isCompressed = Boolean(video.is_already_compressed);
+    const isCloudOnly = Boolean(video.is_cloud_only);
+    const isLowBitrate = Boolean(video.is_low_bitrate);
 
-    const isCompressed = video.is_already_compressed || false;
-    const checkboxChecked = !isCompressed;
+    const duration = video.duration
+        ? formatDuration(video.duration)
+        : (isCloudOnly ? '☁️ En ligne' : 'N/A');
+    const resolution = video.resolution || (isCloudOnly ? '☁️ En ligne' : 'N/A');
+    const bitrate = video.bitrate
+        ? formatBitrate(video.bitrate)
+        : (isCloudOnly ? '☁️ En ligne' : 'N/A');
+
+    // Décocher par défaut si déjà compressé, Cloud-only OneDrive ou déjà à bas bitrate
+    const checkboxChecked = !isCompressed && !isCloudOnly && !isLowBitrate;
+    const checkboxLabel = isCompressed
+        ? '✓ Déjà compressé'
+        : isCloudOnly
+        ? '☁️ En ligne uniquement'
+        : isLowBitrate
+        ? '⚠️ Déjà optimisé'
+        : 'À compresser';
+
+    const statusBadgesHtml = [
+        isCloudOnly
+            ? '<span class="badge badge-cloud-only" title="Ce fichier est stocké sur OneDrive (En ligne uniquement). Il ne sera téléchargé que si vous lancez sa compression.">☁️ OneDrive (En ligne uniquement)</span>'
+            : '',
+        isLowBitrate
+            ? '<span class="badge badge-low-bitrate" title="Cette vidéo a déjà un débit binaire faible (< 1.5 Mbps). Une re-compression risque d\'apporter peu de gain.">⚠️ Déjà optimisé (bitrate bas)</span>'
+            : '',
+    ]
+        .filter(Boolean)
+        .join('');
+
     const compressedLabel = (isCompressed && video.compressed_size_gb != null)
         ? `📦 Fichier compressé (${video.compressed_size_gb} GB • -${video.reduction_percent ?? 0}%) :`
         : '📦 Fichier compressé :';
@@ -397,13 +1098,14 @@ function createVideoCard(video, index) {
                     <div class="flex-grow-1">
                         <h5 class="mb-1">🎥 ${video.name}</h5>
                         <small>${video.relative_path}</small>
+                        ${statusBadgesHtml ? `<div class="video-status-badges">${statusBadgesHtml}</div>` : ''}
                     </div>
                     <div class="form-check">
                         <input class="form-check-input video-checkbox" type="checkbox" 
                                id="checkbox-${index}" data-index="${index}" 
                                ${checkboxChecked ? 'checked' : ''}>
                         <label class="form-check-label text-white" for="checkbox-${index}">
-                            ${isCompressed ? '✓ Déjà compressé' : 'À compresser'}
+                            ${checkboxLabel}
                         </label>
                     </div>
                 </div>
@@ -566,12 +1268,16 @@ function updateSelectedCount() {
 }
 
 function selectAll() {
-    document.querySelectorAll('.video-checkbox').forEach(cb => cb.checked = true);
+    document.querySelectorAll('#videoList .col:not(.d-none) .video-checkbox').forEach(cb => {
+        cb.checked = true;
+    });
     updateSelectedCount();
 }
 
 function deselectAll() {
-    document.querySelectorAll('.video-checkbox').forEach(cb => cb.checked = false);
+    document.querySelectorAll('#videoList .col:not(.d-none) .video-checkbox').forEach(cb => {
+        cb.checked = false;
+    });
     updateSelectedCount();
 }
 
@@ -589,19 +1295,36 @@ async function batchCompress() {
     const progressBar = document.getElementById('batchProgressBar');
     const currentVideoText = document.getElementById('currentVideoText');
     const progressText = document.getElementById('progressText');
+    const batchEtaText = document.getElementById('batchEtaText');
+    const summaryBanner = document.getElementById('batchSummaryBanner');
 
     btn.disabled = true;
     spinner.classList.remove('d-none');
     text.textContent = ' Compression en cours...';
     progressDiv.classList.remove('d-none');
+    if (summaryBanner) {
+        summaryBanner.classList.add('d-none');
+    }
+    if (batchEtaText) {
+        batchEtaText.textContent = '';
+        batchEtaText.classList.add('d-none');
+    }
 
     const selectedIndices = Array.from(checkboxes).map(cb => parseInt(cb.dataset.index, 10));
     const total = selectedIndices.length;
     let completed = 0;
+    let successCount = 0;
+    let totalBeforeGb = 0;
+    let totalAfterGb = 0;
+    let lastKnownSpeedX = null;
+    const batchStartTime = Date.now();
 
     batchCancelled = false;
+    isBatchRunning = true;
+    await setTaskbarProgress(0);
 
-    for (const index of selectedIndices) {
+    for (let pos = 0; pos < selectedIndices.length; pos++) {
+        const index = selectedIndices[pos];
         if (batchCancelled) {
             currentVideoText.textContent = '⏹️ Compression arrêtée par l\'utilisateur';
             progressBar.classList.remove('progress-bar-animated');
@@ -617,15 +1340,52 @@ async function batchCompress() {
         const qualityBtn = cardElement.querySelector('.quality-btn.active');
         const quality = qualityBtn ? qualityBtn.getAttribute('data-quality') : 'medium';
 
+        const queuedDurationS = selectedIndices
+            .slice(pos + 1)
+            .reduce((acc, idx) => acc + (videosData[idx]?.duration || 0), 0);
+
+        const handleBatchProgress = (data) => {
+            if (data.speed != null && data.speed > 0) {
+                lastKnownSpeedX = data.speed;
+            }
+            const currentEtaS = data.eta_seconds ?? null;
+            let totalBatchEtaS = currentEtaS;
+            if (lastKnownSpeedX && lastKnownSpeedX > 0.05 && queuedDurationS > 0) {
+                const queuedEtaS = Math.round(queuedDurationS / lastKnownSpeedX);
+                totalBatchEtaS = (currentEtaS ?? 0) + queuedEtaS;
+            }
+            if (totalBatchEtaS != null) {
+                const etaFormatted = formatDuration(totalBatchEtaS);
+                if (batchEtaText) {
+                    batchEtaText.textContent = `⏳ Reste lot : ~${etaFormatted}`;
+                    batchEtaText.classList.remove('d-none');
+                }
+                progressText.textContent = `${completed} / ${total} • ⏳ ~${etaFormatted}`;
+            }
+            const videoRatio = Math.min(1, Math.max(0, (data.progress ?? 0) / 100));
+            const overallPct = ((completed + videoRatio) / total) * 100;
+            progressBar.style.width = overallPct.toFixed(1) + '%';
+            progressBar.textContent = Math.round(overallPct) + '%';
+            setTaskbarProgress(overallPct);
+        };
+
         try {
-            const result = await compressVideoAsync(index, cardElement, quality);
+            const result = await compressVideoAsync(index, cardElement, quality, handleBatchProgress);
             completed++;
 
             const checkbox = cardElement.querySelector('.video-checkbox');
             checkbox.checked = false;
-            checkbox.nextElementSibling.textContent = '✓ Déjà compressé';
 
-            if (result && result.output_path) {
+            if (result && result.status === 'skipped_no_gain') {
+                checkbox.nextElementSibling.textContent = '🛡️ Original conservé';
+            } else if (result && result.output_path) {
+                checkbox.nextElementSibling.textContent = '✓ Déjà compressé';
+                successCount++;
+                const origGb = result.original_size_gb ?? video.size_gb ?? 0;
+                const compGb = result.compressed_size_gb ?? 0;
+                totalBeforeGb += origGb;
+                totalAfterGb += compGb;
+
                 videosData[index].is_already_compressed = true;
                 videosData[index].compressed_path = result.output_path;
                 videosData[index].compressed_size_gb = result.compressed_size_gb;
@@ -654,6 +1414,8 @@ async function batchCompress() {
                 if (playCompressedBtn) {
                     playCompressedBtn.classList.remove('d-none');
                 }
+
+                updateGlobalStats();
             }
         } catch (error) {
             console.error(`Erreur lors de la compression de ${video.name}:`, error);
@@ -667,7 +1429,23 @@ async function batchCompress() {
         progressBar.style.width = overallProgress + '%';
         progressBar.textContent = Math.round(overallProgress) + '%';
         progressText.textContent = `${completed} / ${total}`;
+        setTaskbarProgress(overallProgress);
     }
+
+    isBatchRunning = false;
+    await setTaskbarProgress(null);
+
+    if (batchEtaText) {
+        batchEtaText.textContent = '';
+        batchEtaText.classList.add('d-none');
+    }
+
+    const batchElapsedS = Math.max(1, Math.round((Date.now() - batchStartTime) / 1000));
+    const savedGb = Math.max(0, totalBeforeGb - totalAfterGb);
+    const savedPercent = totalBeforeGb > 0
+        ? ((savedGb / totalBeforeGb) * 100).toFixed(1)
+        : '0.0';
+    const durationStr = formatDuration(batchElapsedS);
 
     if (!batchCancelled) {
         progressBar.classList.remove('progress-bar-animated');
@@ -676,6 +1454,26 @@ async function batchCompress() {
     } else {
         text.textContent = '⏹️ Arrêté';
     }
+
+    const prefix = batchCancelled ? '⏹️ Lot interrompu' : '✅ Lot terminé';
+    const summaryMsg =
+        `${prefix} : ${successCount}/${total} vidéo(s) compressée(s) • ` +
+        `Avant : ${totalBeforeGb.toFixed(2)} GB → Après : ${totalAfterGb.toFixed(2)} GB • ` +
+        `Économie réelle : ${savedGb.toFixed(2)} GB (-${savedPercent}%) en ${durationStr}`;
+
+    if (summaryBanner) {
+        summaryBanner.textContent = summaryMsg;
+        summaryBanner.classList.remove('d-none', 'alert-success', 'alert-warning');
+        summaryBanner.classList.add(batchCancelled ? 'alert-warning' : 'alert-success');
+        appendLog(batchCancelled ? 'WARNING' : 'SUCCESS', `[Batch] ${summaryMsg}`);
+    }
+
+    if (!batchCancelled) {
+        notifyBatchCompleted(summaryMsg);
+    }
+
+    updateGlobalStats();
+    applyFiltersAndSort();
 
     btn.disabled = false;
     spinner.classList.add('d-none');
@@ -690,7 +1488,7 @@ async function batchCompress() {
     }, 5000);
 }
 
-function compressVideoAsync(index, cardElement, quality) {
+function compressVideoAsync(index, cardElement, quality, onProgress = null) {
     return new Promise(async (resolve, reject) => {
         const video = videosData[index];
         const compressBtn = cardElement.querySelector('.compress-btn');
@@ -699,10 +1497,15 @@ function compressVideoAsync(index, cardElement, quality) {
         const progressBar = statusDiv.querySelector('.progress-bar');
         const statusText = statusDiv.querySelector('.status-text');
 
+        if (video.is_cloud_only) {
+            appendLog('INFO', `[INFO] Téléchargement OneDrive requis avant compression : ${video.name} (${video.path})`);
+        }
+
         if (compressBtn) compressBtn.disabled = true;
         statusDiv.classList.remove('d-none');
         statusDiv.style.display = 'block';
         resultDiv.classList.add('d-none');
+        resultDiv.classList.remove('smart-skip-result');
         progressBar.classList.remove('bg-danger', 'bg-warning');
         progressBar.classList.add('progress-bar-animated');
 
@@ -723,7 +1526,9 @@ function compressVideoAsync(index, cardElement, quality) {
                 if (!data || data.video_index !== index) return;
 
                 if (data.status === 'started') {
-                    statusText.textContent = 'Compression démarrée...';
+                    statusText.textContent = video.is_cloud_only
+                        ? '☁️ Rapatriement OneDrive & démarrage de la compression...'
+                        : 'Compression démarrée...';
                     progressBar.style.width = '0%';
                     progressBar.textContent = '0%';
                 } else if (data.status === 'progress') {
@@ -731,9 +1536,21 @@ function compressVideoAsync(index, cardElement, quality) {
                     progressBar.style.width = progress + '%';
                     progressBar.textContent = progress + '%';
                     progressBar.setAttribute('aria-valuenow', progress);
-                    const cur = (data.current_time ?? 0).toFixed(0);
-                    const tot = (data.total_duration ?? 0).toFixed(0);
-                    statusText.textContent = `${cur}s / ${tot}s`;
+                    const cur = (data.current_time ?? 0).toFixed(1);
+                    const tot = (data.total_duration ?? 0).toFixed(1);
+                    const speedPart = (data.speed != null && data.speed > 0)
+                        ? ` • ⚡ ${Number(data.speed).toFixed(1)}x`
+                        : '';
+                    const etaPart = (data.eta_seconds != null)
+                        ? ` • ⏳ Reste : ~${formatDuration(data.eta_seconds)}`
+                        : '';
+                    statusText.textContent = `Compression en cours... (${cur}s / ${tot}s${speedPart}${etaPart})`;
+                    if (!isBatchRunning) {
+                        setTaskbarProgress(progress);
+                    }
+                    if (typeof onProgress === 'function') {
+                        onProgress(data);
+                    }
                 } else if (data.status === 'completed') {
                     if (settled) return;
                     settled = true;
@@ -743,6 +1560,14 @@ function compressVideoAsync(index, cardElement, quality) {
                     progressBar.textContent = '100%';
                     progressBar.classList.remove('progress-bar-animated');
                     statusText.textContent = 'Compression terminée !';
+
+                    recordLifetimeCompression(
+                        data.original_size_gb ?? video?.size_gb ?? 0,
+                        data.compressed_size_gb ?? 0
+                    );
+                    if (!isBatchRunning) {
+                        setTaskbarProgress(null);
+                    }
 
                     resultDiv.innerHTML = `
                         <h6>✅ Compression réussie !</h6>
@@ -761,10 +1586,40 @@ function compressVideoAsync(index, cardElement, quality) {
                     }
 
                     resolve(data);
+                } else if (data.status === 'skipped_no_gain') {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    if (!isBatchRunning) {
+                        setTaskbarProgress(null);
+                    }
+
+                    progressBar.style.width = '100%';
+                    progressBar.textContent = '100%';
+                    progressBar.classList.remove('progress-bar-animated');
+                    progressBar.classList.add('bg-warning');
+                    statusText.textContent = '🛡️ Ignorée (Smart Skip) — original conservé';
+
+                    resultDiv.innerHTML = `
+                        <h6>🛡️ Ignorée (Smart Skip)</h6>
+                        <p class="mb-0">🛡️ Ignorée (Smart Skip) : le fichier généré (${data.compressed_size_gb} GB) n'était pas plus léger que l'original (${data.original_size_gb} GB) — original conservé</p>
+                    `;
+                    resultDiv.classList.add('smart-skip-result');
+                    resultDiv.classList.remove('d-none');
+
+                    if (compressBtn) {
+                        compressBtn.disabled = false;
+                        compressBtn.textContent = '🛡️ Original conservé (Smart Skip)';
+                    }
+
+                    resolve(data);
                 } else if (data.status === 'cancelled') {
                     if (settled) return;
                     settled = true;
                     cleanup();
+                    if (!isBatchRunning) {
+                        setTaskbarProgress(null);
+                    }
 
                     statusText.textContent = '⏹️ Compression arrêtée par l\'utilisateur';
                     progressBar.classList.remove('progress-bar-animated');
@@ -776,6 +1631,9 @@ function compressVideoAsync(index, cardElement, quality) {
                     if (settled) return;
                     settled = true;
                     cleanup();
+                    if (!isBatchRunning) {
+                        setTaskbarProgress(null);
+                    }
 
                     statusText.textContent = 'Erreur: ' + (data.message || 'Erreur inconnue');
                     progressBar.classList.remove('progress-bar-animated');
@@ -792,6 +1650,9 @@ function compressVideoAsync(index, cardElement, quality) {
                     if (!settled) {
                         settled = true;
                         cleanup();
+                        if (!isBatchRunning) {
+                            setTaskbarProgress(null);
+                        }
                         statusText.textContent = '⏹️ Compression arrêtée par l\'utilisateur';
                         progressBar.classList.remove('progress-bar-animated');
                         progressBar.classList.add('bg-warning');
@@ -801,15 +1662,21 @@ function compressVideoAsync(index, cardElement, quality) {
                 },
             };
 
+            const selectedCodec = document.getElementById('codecSelect')?.value || currentVideoCodec || 'h264';
+
             await invoke('start_compression', {
                 videoIndex: index,
                 inputPath: video.path,
                 quality,
+                codec: selectedCodec,
             });
         } catch (err) {
             if (!settled) {
                 settled = true;
                 cleanup();
+                if (!isBatchRunning) {
+                    setTaskbarProgress(null);
+                }
                 const errMsg = typeof err === 'string' ? err : (err?.message || String(err));
                 statusText.textContent = 'Erreur: ' + errMsg;
                 progressBar.classList.remove('progress-bar-animated');
@@ -826,8 +1693,22 @@ async function compressVideo(index, cardElement) {
     const qualityBtn = cardElement.querySelector('.quality-btn.active');
     const quality = qualityBtn ? qualityBtn.getAttribute('data-quality') : 'medium';
 
+    if (!isBatchRunning) {
+        await setTaskbarProgress(0);
+    }
+
     try {
         const data = await compressVideoAsync(index, cardElement, quality);
+
+        const checkbox = cardElement.querySelector('.video-checkbox');
+        if (data && data.status === 'skipped_no_gain') {
+            if (checkbox) {
+                checkbox.checked = false;
+                checkbox.nextElementSibling.textContent = '🛡️ Original conservé';
+            }
+            updateSelectedCount();
+            return;
+        }
 
         videosData[index].is_already_compressed = true;
         videosData[index].compressed_path = data.output_path;
@@ -835,7 +1716,6 @@ async function compressVideo(index, cardElement) {
         videosData[index].reduction_percent = data.reduction_percent;
 
         // Décocher la checkbox et mettre à jour le label
-        const checkbox = cardElement.querySelector('.video-checkbox');
         checkbox.checked = false;
         checkbox.nextElementSibling.textContent = '✓ Déjà compressé';
         updateSelectedCount();
@@ -865,11 +1745,18 @@ async function compressVideo(index, cardElement) {
         if (playCompressedBtn) {
             playCompressedBtn.classList.remove('d-none');
         }
+
+        updateGlobalStats();
+        applyFiltersAndSort();
     } catch (error) {
         if (error.message && error.message.includes('annulée')) {
             return;
         }
         alert(`❌ Erreur lors de la compression de "${video.name}":\n\n${error.message}\n\nVérifiez les logs pour plus de détails.`);
+    } finally {
+        if (!isBatchRunning) {
+            await setTaskbarProgress(null);
+        }
     }
 }
 

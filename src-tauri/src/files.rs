@@ -1,5 +1,5 @@
 use crate::logger::{log_error, log_info, log_success};
-use crate::scanner::{normalize_path, strip_long_prefix};
+use crate::scanner::{normalize_path, strip_long_prefix, ALLOWED_VIDEO_EXTENSIONS};
 use crate::state::CREATE_NO_WINDOW;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -47,14 +47,22 @@ pub struct ActionResponse {
     pub message: String,
 }
 
-/// Valide qu'un chemin pointe vers un fichier `.mp4` existant avant suppression vers la corbeille.
-pub fn validate_mp4_for_deletion(raw_path: &str) -> Result<String, String> {
+/// Valide qu'un chemin pointe vers un fichier vidéo supporté (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`)
+/// existant sur le disque avant envoi vers la corbeille Windows.
+pub fn validate_video_for_deletion(raw_path: &str) -> Result<String, String> {
     let normalized = normalize_path(raw_path);
     if normalized.is_empty() {
         return Err("Chemin de fichier manquant".to_string());
     }
-    if !normalized.to_lowercase().ends_with(".mp4") {
-        return Err("Seuls les fichiers MP4 peuvent être supprimés".to_string());
+    let lower = normalized.to_lowercase();
+    let is_allowed_video = ALLOWED_VIDEO_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+    if !is_allowed_video {
+        return Err(
+            "Seuls les fichiers vidéo (.mp4, .mov, .mkv, .avi, .webm) peuvent être supprimés"
+                .to_string(),
+        );
     }
     if !Path::new(&normalized).exists() {
         return Err("Fichier introuvable".to_string());
@@ -62,21 +70,22 @@ pub fn validate_mp4_for_deletion(raw_path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-/// Calcule le chemin du fichier compressé correspondant `<parent>/<stem>_compressed.<ext>`.
-pub fn compute_compressed_counterpart(original_mp4_path: &Path) -> PathBuf {
-    let stem = original_mp4_path
+/// Alias de compatibilité vers `validate_video_for_deletion`.
+pub fn validate_mp4_for_deletion(raw_path: &str) -> Result<String, String> {
+    validate_video_for_deletion(raw_path)
+}
+
+/// Calcule le chemin du fichier compressé correspondant `<parent>/<stem>_compressed.mp4`.
+pub fn compute_compressed_counterpart(original_video_path: &Path) -> PathBuf {
+    let stem = original_video_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let suffix = original_mp4_path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_else(|| ".mp4".to_string());
-    let parent = original_mp4_path.parent().unwrap_or_else(|| Path::new(""));
-    parent.join(format!("{}_compressed{}", stem, suffix))
+    let parent = original_video_path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!("{}_compressed.mp4", stem))
 }
 
-/// Renomme `<stem>_compressed.<ext>` en `<stem>.<ext>` une fois le fichier original envoyé à la corbeille.
+/// Renomme `<stem>_compressed.mp4` en `<stem>.mp4` une fois le fichier original envoyé à la corbeille.
 pub fn rename_compressed_to_original(original_path: &Path) -> Result<Option<String>, String> {
     if original_path.exists() {
         return Err("Le fichier original existe encore sur le disque".to_string());
@@ -85,15 +94,22 @@ pub fn rename_compressed_to_original(original_path: &Path) -> Result<Option<Stri
     if !compressed_path.exists() {
         return Ok(None);
     }
-    std::fs::rename(&compressed_path, original_path).map_err(|e| {
+    let stem = original_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent = original_path.parent().unwrap_or_else(|| Path::new(""));
+    let target_path = parent.join(format!("{}.mp4", stem));
+
+    std::fs::rename(&compressed_path, &target_path).map_err(|e| {
         format!(
             "Impossible de renommer '{}' en '{}' : {}",
             strip_long_prefix(&compressed_path.to_string_lossy()),
-            strip_long_prefix(&original_path.to_string_lossy()),
+            strip_long_prefix(&target_path.to_string_lossy()),
             e
         )
     })?;
-    Ok(Some(strip_long_prefix(&original_path.to_string_lossy())))
+    Ok(Some(strip_long_prefix(&target_path.to_string_lossy())))
 }
 
 #[tauri::command]
@@ -129,7 +145,7 @@ pub async fn delete_file(
     file_path: String,
     rename_compressed: Option<bool>,
 ) -> Result<DeleteResponse, String> {
-    let normalized = validate_mp4_for_deletion(&file_path)?;
+    let normalized = validate_video_for_deletion(&file_path)?;
     let clean_path = strip_long_prefix(&normalized);
     let should_rename = rename_compressed.unwrap_or(false);
 
@@ -194,25 +210,18 @@ pub async fn delete_batch(
     let results = tokio::task::spawn_blocking(move || {
         let mut items = Vec::with_capacity(file_paths.len());
         for raw_path in file_paths {
-            let normalized = normalize_path(&raw_path);
-            if !normalized.to_lowercase().ends_with(".mp4") {
-                items.push(BatchDeleteItemResult {
-                    path: raw_path,
-                    status: "error".to_string(),
-                    message: Some("Seuls les fichiers MP4 peuvent être supprimés".to_string()),
-                    renamed_to: None,
-                });
-                continue;
-            }
-            if !Path::new(&normalized).exists() {
-                items.push(BatchDeleteItemResult {
-                    path: raw_path,
-                    status: "error".to_string(),
-                    message: Some("Fichier introuvable".to_string()),
-                    renamed_to: None,
-                });
-                continue;
-            }
+            let normalized = match validate_video_for_deletion(&raw_path) {
+                Ok(n) => n,
+                Err(err_msg) => {
+                    items.push(BatchDeleteItemResult {
+                        path: raw_path,
+                        status: "error".to_string(),
+                        message: Some(err_msg),
+                        renamed_to: None,
+                    });
+                    continue;
+                }
+            };
 
             let clean_path = strip_long_prefix(&normalized);
             match trash::delete(&clean_path) {
@@ -355,7 +364,10 @@ mod tests {
         );
         assert_eq!(
             validate_mp4_for_deletion(r"C:\Videos\document.pdf"),
-            Err("Seuls les fichiers MP4 peuvent être supprimés".to_string())
+            Err(
+                "Seuls les fichiers vidéo (.mp4, .mov, .mkv, .avi, .webm) peuvent être supprimés"
+                    .to_string()
+            )
         );
         assert_eq!(
             validate_mp4_for_deletion(r"C:\Videos\introuvable_12345.mp4"),
@@ -364,13 +376,25 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_mp4_for_deletion_accepts_existing_mp4() {
+    fn test_validate_video_for_deletion_accepts_all_supported_formats() {
         let dir = tempdir().unwrap();
-        let mp4_path = dir.path().join("sample.MP4");
-        File::create(&mp4_path).unwrap();
-
-        let validated = validate_mp4_for_deletion(&mp4_path.to_string_lossy());
-        assert!(validated.is_ok());
+        for file_name in [
+            "sample.MP4",
+            "iphone.MOV",
+            "capture.mkv",
+            "legacy.AVI",
+            "clip.WebM",
+        ] {
+            let video_path = dir.path().join(file_name);
+            File::create(&video_path).unwrap();
+            let validated = validate_video_for_deletion(&video_path.to_string_lossy());
+            assert!(
+                validated.is_ok(),
+                "Expected '{}' to be accepted for deletion, got {:?}",
+                file_name,
+                validated
+            );
+        }
     }
 
     #[test]
@@ -384,7 +408,13 @@ mod tests {
         let p_upper = Path::new(r"C:\Videos\CLIP.MP4");
         assert_eq!(
             compute_compressed_counterpart(p_upper),
-            PathBuf::from(r"C:\Videos\CLIP_compressed.MP4")
+            PathBuf::from(r"C:\Videos\CLIP_compressed.mp4")
+        );
+
+        let p_mov = Path::new(r"C:\Videos\iphone_record.MOV");
+        assert_eq!(
+            compute_compressed_counterpart(p_mov),
+            PathBuf::from(r"C:\Videos\iphone_record_compressed.mp4")
         );
     }
 
@@ -428,6 +458,22 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
         assert_eq!(content, "compressed-video-bytes");
+
+        // Tester également avec un fichier source .mov : <stem>_compressed.mp4 doit devenir <stem>.mp4
+        let orig_mov = dir.path().join("iphone_clip.mov");
+        let comp_mov_mp4 = dir.path().join("iphone_clip_compressed.mp4");
+        let expected_final_mp4 = dir.path().join("iphone_clip.mp4");
+        File::create(&comp_mov_mp4)
+            .unwrap()
+            .write_all(b"converted-mp4-bytes")
+            .unwrap();
+
+        let renamed_mov = rename_compressed_to_original(&orig_mov)
+            .expect("rename_compressed_to_original for .mov should succeed")
+            .expect("Expected Some(renamed_path) for .mov");
+        assert_eq!(renamed_mov, expected_final_mp4.to_string_lossy().to_string());
+        assert!(expected_final_mp4.exists());
+        assert!(!comp_mov_mp4.exists());
     }
 
     #[test]

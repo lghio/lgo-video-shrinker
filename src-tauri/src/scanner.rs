@@ -4,11 +4,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::{AppHandle, State};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+pub const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+pub const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+pub const MAX_SCAN_WORKERS: usize = 6;
+pub const ALLOWED_VIDEO_EXTENSIONS: [&str; 5] = [".mp4", ".mov", ".mkv", ".avi", ".webm"];
+
+/// Vérifie si un nom ou chemin de fichier correspond à un format vidéo supporté
+/// (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`) tout en excluant les fichiers temporaires
+/// `.tmp.mp4` et les sorties déjà compressées `_compressed.mp4`.
+pub fn is_supported_video_extension(path_or_name: &str) -> bool {
+    let lower = path_or_name.trim().to_lowercase();
+    if lower.ends_with(".tmp.mp4") || lower.ends_with("_compressed.mp4") {
+        return false;
+    }
+    ALLOWED_VIDEO_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VideoItem {
@@ -24,6 +45,10 @@ pub struct VideoItem {
     pub compressed_path: Option<String>,
     pub compressed_size_gb: Option<f64>,
     pub reduction_percent: Option<f64>,
+    #[serde(default)]
+    pub is_cloud_only: bool,
+    #[serde(default)]
+    pub is_low_bitrate: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -32,6 +57,98 @@ pub struct ScanResponse {
     pub total_size_gb: f64,
     pub videos: Vec<VideoItem>,
     pub scanned_directory: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ScanProgressPayload {
+    pub current: usize,
+    pub total: usize,
+    pub current_file: String,
+}
+
+/// Détecte si les attributs de fichier Windows correspondent à un fichier OneDrive "En ligne uniquement" (Cloud-only placeholder).
+pub fn is_cloud_only_attributes(file_attributes: u32) -> bool {
+    (file_attributes
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+        != 0
+}
+
+/// Vérifie à partir des métadonnées système si le fichier est un placeholder Cloud-only OneDrive sans l'ouvrir.
+pub fn is_metadata_cloud_only(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        is_cloud_only_attributes(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Détecte si une vidéo a déjà un bitrate très bas (< 1.5 Mbps en HD/standard, ou < 800 kbps si largeur <= 640).
+pub fn is_low_bitrate_video(bitrate: Option<u64>, resolution: Option<&str>) -> bool {
+    let Some(br) = bitrate else {
+        return false;
+    };
+    if br == 0 {
+        return false;
+    }
+
+    let width = resolution
+        .and_then(|res| res.split('x').next())
+        .and_then(|w| w.trim().parse::<u64>().ok());
+
+    let threshold = match width {
+        Some(w) if w > 0 && w <= 640 => 800_000,
+        _ => 1_500_000,
+    };
+
+    br < threshold
+}
+
+/// Détermine si la piste audio principale est déjà au format AAC mono/stéréo avec un débit <= 135 kbps (~128 kbps)
+/// et peut être copiée telle quelle (`-c:a copy`) sans ré-encodage.
+pub fn can_passthrough_audio(info: &Value) -> bool {
+    let Some(streams) = info.get("streams").and_then(|s| s.as_array()) else {
+        return false;
+    };
+
+    let Some(audio_stream) = streams
+        .iter()
+        .find(|s| s.get("codec_type").and_then(|c| c.as_str()) == Some("audio"))
+    else {
+        return false;
+    };
+
+    let is_aac = audio_stream
+        .get("codec_name")
+        .and_then(|c| c.as_str())
+        .map(|name| name.trim().eq_ignore_ascii_case("aac"))
+        .unwrap_or(false);
+    if !is_aac {
+        return false;
+    }
+
+    let valid_channels = audio_stream
+        .get("channels")
+        .and_then(|c| c.as_u64())
+        .map(|ch| (1..=2).contains(&ch))
+        .unwrap_or(false);
+    if !valid_channels {
+        return false;
+    }
+
+    let bit_rate = audio_stream.get("bit_rate").and_then(|br| {
+        br.as_str()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or_else(|| br.as_u64())
+    });
+
+    matches!(bit_rate, Some(br) if br > 0 && br <= 135_000)
 }
 
 /// Supprime le préfixe `\\?\` des chemins longs Windows.
@@ -203,11 +320,24 @@ pub fn compute_relative_path(file_path: &str, base_dir: &str) -> String {
     }
 }
 
-pub fn scan_directory_sync(
+struct CandidateVideoEntry {
+    file_path: String,
+    file_name: String,
+    size_bytes: u64,
+    size_gb: f64,
+    is_cloud_only: bool,
+}
+
+pub fn scan_directory_with_progress<F>(
     ffprobe_path: &Path,
     raw_dir: &str,
     min_size_gb: f64,
-) -> Result<ScanResponse, String> {
+    cancel_flag: Option<&AtomicBool>,
+    on_progress: F,
+) -> Result<ScanResponse, String>
+where
+    F: Fn(usize, usize, &str) + Sync,
+{
     let scan_directory = normalize_path(raw_dir);
     if scan_directory.is_empty() {
         return Err("Veuillez spécifier un répertoire à scanner.".to_string());
@@ -231,18 +361,18 @@ pub fn scan_directory_sync(
         ));
     }
 
-    let mut videos: Vec<VideoItem> = Vec::new();
+    // Étape 1 : Collecte rapide des candidats éligibles via WalkDir
+    let mut candidates: Vec<CandidateVideoEntry> = Vec::new();
 
     for entry in WalkDir::new(&walk_root).into_iter().filter_map(|e| e.ok()) {
+        if cancel_flag.map_or(false, |f| f.load(Ordering::Relaxed)) {
+            break;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
         let file_name = entry.file_name().to_string_lossy().to_string();
-        let lower_name = file_name.to_lowercase();
-        if !lower_name.ends_with(".mp4")
-            || lower_name.ends_with(".tmp.mp4")
-            || lower_name.ends_with("_compressed.mp4")
-        {
+        if !is_supported_video_extension(&file_name) {
             continue;
         }
 
@@ -263,68 +393,136 @@ pub fn scan_directory_sync(
         let size_gb = get_file_size_gb(size_bytes);
 
         if size_gb >= min_size_gb {
-            let path_obj = PathBuf::from(&file_path);
-            let stem = path_obj
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let suffix = path_obj
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_else(|| ".mp4".to_string());
-            let parent = path_obj.parent().unwrap_or_else(|| Path::new(""));
-            let compressed_path_buf = parent.join(format!("{}_compressed{}", stem, suffix));
-            let compressed_path_str = compressed_path_buf.to_string_lossy().to_string();
-            let is_already_compressed = compressed_path_buf.exists();
-
-            let (compressed_size_gb, reduction_percent) = if is_already_compressed {
-                match std::fs::metadata(&compressed_path_buf) {
-                    Ok(comp_meta) => {
-                        let comp_bytes = comp_meta.len();
-                        let comp_size_gb = get_file_size_gb(comp_bytes);
-                        let reduction = if size_gb > 0.0 {
-                            Some(round_1(((size_gb - comp_size_gb) / size_gb) * 100.0))
-                        } else {
-                            None
-                        };
-                        (Some(round_2(comp_size_gb)), reduction)
-                    }
-                    Err(_) => (None, None),
-                }
-            } else {
-                (None, None)
-            };
-
-            let info = get_video_info(ffprobe_path, &file_path);
-            let (duration, resolution, bitrate) = extract_metadata_from_probe(&info);
-
-            let relative_path = compute_relative_path(&file_path, &scan_directory);
-
-            videos.push(VideoItem {
-                path: file_path,
-                name: file_name,
-                size_gb: round_2(size_gb),
+            let is_cloud_only = is_metadata_cloud_only(&metadata);
+            candidates.push(CandidateVideoEntry {
+                file_path,
+                file_name,
                 size_bytes,
-                duration,
-                resolution,
-                bitrate,
-                relative_path,
-                is_already_compressed,
-                compressed_path: if is_already_compressed {
-                    Some(compressed_path_str)
-                } else {
-                    None
-                },
-                compressed_size_gb,
-                reduction_percent,
+                size_gb,
+                is_cloud_only,
             });
         }
     }
 
+    let total_candidates = candidates.len();
+    let videos_mutex: Mutex<Vec<VideoItem>> = Mutex::new(Vec::with_capacity(total_candidates));
+
+    if total_candidates > 0 && !cancel_flag.map_or(false, |f| f.load(Ordering::Relaxed)) {
+        on_progress(0, total_candidates, "");
+
+        // Étape 2 : Extraction parallèle des métadonnées ffprobe (jusqu'à MAX_SCAN_WORKERS threads)
+        let worker_count = total_candidates.min(MAX_SCAN_WORKERS).max(1);
+        let next_idx = AtomicUsize::new(0);
+        let done_count = AtomicUsize::new(0);
+        let candidates_ref = &candidates;
+        let scan_dir_ref = &scan_directory;
+        let videos_ref = &videos_mutex;
+        let progress_ref = &on_progress;
+
+        std::thread::scope(|s| {
+            for _ in 0..worker_count {
+                let next_idx_ref = &next_idx;
+                let done_count_ref = &done_count;
+                s.spawn(move || {
+                    let mut local_items: Vec<VideoItem> = Vec::new();
+                    loop {
+                        if cancel_flag.map_or(false, |f| f.load(Ordering::Relaxed)) {
+                            break;
+                        }
+                        let idx = next_idx_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_candidates {
+                            break;
+                        }
+
+                        let cand = &candidates_ref[idx];
+                        let path_obj = PathBuf::from(&cand.file_path);
+                        let stem = path_obj
+                            .file_stem()
+                            .map(|st| st.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let parent = path_obj.parent().unwrap_or_else(|| Path::new(""));
+                        let compressed_path_buf =
+                            parent.join(format!("{}_compressed.mp4", stem));
+                        let compressed_path_str =
+                            compressed_path_buf.to_string_lossy().to_string();
+                        let is_already_compressed = compressed_path_buf.exists();
+
+                        let (compressed_size_gb, reduction_percent) = if is_already_compressed {
+                            match std::fs::metadata(&compressed_path_buf) {
+                                Ok(comp_meta) => {
+                                    let comp_bytes = comp_meta.len();
+                                    let comp_size_gb = get_file_size_gb(comp_bytes);
+                                    let reduction = if cand.size_gb > 0.0 {
+                                        Some(round_1(
+                                            ((cand.size_gb - comp_size_gb) / cand.size_gb) * 100.0,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    (Some(round_2(comp_size_gb)), reduction)
+                                }
+                                Err(_) => (None, None),
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                        // Ne jamais exécuter ffprobe sur un fichier OneDrive "Cloud-only" pour éviter son téléchargement forcé
+                        let (duration, resolution, bitrate) = if cand.is_cloud_only {
+                            (None, None, None)
+                        } else {
+                            let info = get_video_info(ffprobe_path, &cand.file_path);
+                            extract_metadata_from_probe(&info)
+                        };
+
+                        let is_low_bitrate = !is_already_compressed
+                            && !cand.is_cloud_only
+                            && is_low_bitrate_video(bitrate, resolution.as_deref());
+
+                        let relative_path = compute_relative_path(&cand.file_path, scan_dir_ref);
+
+                        local_items.push(VideoItem {
+                            path: cand.file_path.clone(),
+                            name: cand.file_name.clone(),
+                            size_gb: round_2(cand.size_gb),
+                            size_bytes: cand.size_bytes,
+                            duration,
+                            resolution,
+                            bitrate,
+                            relative_path,
+                            is_already_compressed,
+                            compressed_path: if is_already_compressed {
+                                Some(compressed_path_str)
+                            } else {
+                                None
+                            },
+                            compressed_size_gb,
+                            reduction_percent,
+                            is_cloud_only: cand.is_cloud_only,
+                            is_low_bitrate,
+                        });
+
+                        let completed = done_count_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                        progress_ref(completed, total_candidates, &cand.file_name);
+                    }
+
+                    if !local_items.is_empty() {
+                        if let Ok(mut guard) = videos_ref.lock() {
+                            guard.extend(local_items);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let mut videos = videos_mutex.into_inner().unwrap_or_default();
+
+    // Étape 3 : Tri déterministe par taille décroissante (size_bytes puis nom)
     videos.sort_by(|a, b| {
-        b.size_gb
-            .partial_cmp(&a.size_gb)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.name.cmp(&b.name))
     });
 
     let total_size_gb = round_2(videos.iter().map(|v| v.size_gb).sum());
@@ -336,6 +534,24 @@ pub fn scan_directory_sync(
         videos,
         scanned_directory: scan_directory,
     })
+}
+
+pub fn scan_directory_sync(
+    ffprobe_path: &Path,
+    raw_dir: &str,
+    min_size_gb: f64,
+) -> Result<ScanResponse, String> {
+    scan_directory_with_progress(ffprobe_path, raw_dir, min_size_gb, None, |_, _, _| {})
+}
+
+#[tauri::command]
+pub fn cancel_scan(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.scan_cancelled.store(true, Ordering::SeqCst);
+    log_info(
+        &app,
+        "[SCAN] Arrêt du scan demandé par l'utilisateur.".to_string(),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -351,6 +567,11 @@ pub async fn scan_videos(
     let min_size = min_size_gb.unwrap_or(0.0);
     let ffprobe_path = state.ffprobe_path.clone();
 
+    state.scan_cancelled.store(false, Ordering::SeqCst);
+    let cancel_flag = state.scan_cancelled.clone();
+    let cancel_flag_for_check = state.scan_cancelled.clone();
+    let app_for_progress = app.clone();
+
     log_info(
         &app,
         format!(
@@ -360,20 +581,47 @@ pub async fn scan_videos(
     );
 
     let result = tokio::task::spawn_blocking(move || {
-        scan_directory_sync(&ffprobe_path, &raw_dir, min_size)
+        scan_directory_with_progress(
+            &ffprobe_path,
+            &raw_dir,
+            min_size,
+            Some(&cancel_flag),
+            |current, total, current_file| {
+                let _ = app_for_progress.emit(
+                    "scan://progress",
+                    ScanProgressPayload {
+                        current,
+                        total,
+                        current_file: current_file.to_string(),
+                    },
+                );
+            },
+        )
     })
     .await
     .map_err(|e| format!("Erreur interne lors du scan : {}", e))?;
 
     match &result {
         Ok(resp) => {
-            log_info(
-                &app,
-                format!(
-                    "[SCAN] {} vidéo(s) trouvée(s) ({} GB au total)",
-                    resp.count, resp.total_size_gb
-                ),
-            );
+            if cancel_flag_for_check.load(Ordering::Relaxed) {
+                log_info(
+                    &app,
+                    format!(
+                        "[SCAN] Scan interrompu par l'utilisateur : {} vidéo(s) retenue(s) ({} GB au total)",
+                        resp.count, resp.total_size_gb
+                    ),
+                );
+            } else {
+                let cloud_count = resp.videos.iter().filter(|v| v.is_cloud_only).count();
+                let low_br_count = resp.videos.iter().filter(|v| v.is_low_bitrate).count();
+                log_info(
+                    &app,
+                    format!(
+                        "[SCAN] {} vidéo(s) trouvée(s) ({} GB au total • Cloud-only OneDrive : {} • Déjà optimisées/bas bitrate : {})",
+                        resp.count, resp.total_size_gb, cloud_count, low_br_count
+                    ),
+                );
+            }
         }
         Err(err) => {
             log_error(&app, format!("[SCAN] Erreur : {}", err));
@@ -566,5 +814,236 @@ mod tests {
         assert!(found.compressed_path.is_some());
         assert!(found.compressed_size_gb.is_some());
         assert_eq!(found.reduction_percent, Some(50.0));
+    }
+
+    #[test]
+    fn test_is_cloud_only_attributes() {
+        // Normal / Archive attributes
+        assert!(!is_cloud_only_attributes(0));
+        assert!(!is_cloud_only_attributes(0x00000020)); // FILE_ATTRIBUTE_ARCHIVE
+        assert!(!is_cloud_only_attributes(0x00000080)); // FILE_ATTRIBUTE_NORMAL
+
+        // OneDrive Cloud-only flags
+        assert!(is_cloud_only_attributes(FILE_ATTRIBUTE_OFFLINE));
+        assert!(is_cloud_only_attributes(FILE_ATTRIBUTE_RECALL_ON_OPEN));
+        assert!(is_cloud_only_attributes(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS));
+        assert!(is_cloud_only_attributes(
+            0x00000020 | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        ));
+    }
+
+    #[test]
+    fn test_is_low_bitrate_video() {
+        assert!(!is_low_bitrate_video(None, Some("1920x1080")));
+        assert!(!is_low_bitrate_video(Some(0), Some("1920x1080")));
+
+        // Standard / HD (> 640 width): threshold is 1_500_000 bps (1.5 Mbps)
+        assert!(is_low_bitrate_video(Some(1_200_000), Some("1920x1080")));
+        assert!(is_low_bitrate_video(Some(1_499_999), Some("1280x720")));
+        assert!(!is_low_bitrate_video(Some(1_500_000), Some("1280x720")));
+        assert!(!is_low_bitrate_video(Some(4_500_000), Some("1920x1080")));
+
+        // Small resolution (width <= 640): threshold is 800_000 bps (800 kbps)
+        assert!(is_low_bitrate_video(Some(600_000), Some("640x360")));
+        assert!(!is_low_bitrate_video(Some(900_000), Some("640x360")));
+
+        // Unknown resolution defaults to 1.5 Mbps threshold
+        assert!(is_low_bitrate_video(Some(1_100_000), None));
+        assert!(!is_low_bitrate_video(Some(2_000_000), None));
+    }
+
+    #[test]
+    fn test_scan_directory_with_progress_parallel_and_cancellation() {
+        let dir = tempdir().unwrap();
+        let sizes = [1024usize, 8192, 4096, 2048, 16384, 512, 32768, 65536];
+        for (i, sz) in sizes.iter().enumerate() {
+            let file_path = dir.path().join(format!("clip_{}.mp4", i));
+            File::create(&file_path)
+                .unwrap()
+                .write_all(&vec![0u8; *sz])
+                .unwrap();
+        }
+
+        let cancel_flag = AtomicBool::new(false);
+        let progress_events: Mutex<Vec<(usize, usize, String)>> = Mutex::new(Vec::new());
+
+        let resp = scan_directory_with_progress(
+            Path::new("nonexistent_ffprobe"),
+            &dir.path().to_string_lossy(),
+            0.0,
+            Some(&cancel_flag),
+            |current, total, file_name| {
+                progress_events.lock().unwrap().push((
+                    current,
+                    total,
+                    file_name.to_string(),
+                ));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.count, sizes.len());
+        // Check descending sort by size_bytes
+        for pair in resp.videos.windows(2) {
+            assert!(
+                pair[0].size_bytes >= pair[1].size_bytes,
+                "Expected descending size_bytes order: {} >= {}",
+                pair[0].size_bytes,
+                pair[1].size_bytes
+            );
+        }
+
+        let events = progress_events.into_inner().unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().any(|(cur, tot, _)| *cur == sizes.len() && *tot == sizes.len()));
+
+        // Test cancellation flag stops scan
+        let pre_cancelled = AtomicBool::new(true);
+        let cancelled_resp = scan_directory_with_progress(
+            Path::new("nonexistent_ffprobe"),
+            &dir.path().to_string_lossy(),
+            0.0,
+            Some(&pre_cancelled),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(cancelled_resp.count, 0);
+    }
+
+    #[test]
+    fn test_is_supported_video_extension_and_multiformat_scan() {
+        assert!(is_supported_video_extension("video.mp4"));
+        assert!(is_supported_video_extension("iphone_clip.MOV"));
+        assert!(is_supported_video_extension("obs_record.mkv"));
+        assert!(is_supported_video_extension("archive.Avi"));
+        assert!(is_supported_video_extension("web_capture.WEBM"));
+
+        assert!(!is_supported_video_extension("video_compressed.mp4"));
+        assert!(!is_supported_video_extension("VIDEO_COMPRESSED.MP4"));
+        assert!(!is_supported_video_extension("video_compressed.tmp.mp4"));
+        assert!(!is_supported_video_extension("document.pdf"));
+        assert!(!is_supported_video_extension("audio.mp3"));
+
+        let dir = tempdir().unwrap();
+        let mov_file = dir.path().join("iphone.MOV");
+        let mov_comp = dir.path().join("iphone_compressed.mp4");
+        let mkv_file = dir.path().join("recording.mkv");
+        let avi_file = dir.path().join("old_clip.avi");
+        let webm_file = dir.path().join("browser.webm");
+        let ignored_doc = dir.path().join("readme.txt");
+
+        File::create(&mov_file)
+            .unwrap()
+            .write_all(&vec![0u8; 4000])
+            .unwrap();
+        File::create(&mov_comp)
+            .unwrap()
+            .write_all(&vec![0u8; 1000])
+            .unwrap();
+        File::create(&mkv_file)
+            .unwrap()
+            .write_all(&vec![0u8; 3000])
+            .unwrap();
+        File::create(&avi_file)
+            .unwrap()
+            .write_all(&vec![0u8; 2000])
+            .unwrap();
+        File::create(&webm_file)
+            .unwrap()
+            .write_all(&vec![0u8; 1500])
+            .unwrap();
+        File::create(&ignored_doc)
+            .unwrap()
+            .write_all(b"ignore me")
+            .unwrap();
+
+        let resp = scan_directory_sync(
+            Path::new("nonexistent_ffprobe"),
+            &dir.path().to_string_lossy(),
+            0.0,
+        )
+        .unwrap();
+
+        // Doit détecter les 4 vidéos sources (.MOV, .mkv, .avi, .webm) et exclure iphone_compressed.mp4 + readme.txt
+        assert_eq!(resp.count, 4);
+
+        let mov_item = resp
+            .videos
+            .iter()
+            .find(|v| v.name == "iphone.MOV")
+            .expect("iphone.MOV should be in scan results");
+        assert!(mov_item.is_already_compressed);
+        assert!(mov_item
+            .compressed_path
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("iphone_compressed.mp4"));
+        assert_eq!(mov_item.reduction_percent, Some(75.0));
+
+        let mkv_item = resp
+            .videos
+            .iter()
+            .find(|v| v.name == "recording.mkv")
+            .expect("recording.mkv should be in scan results");
+        assert!(!mkv_item.is_already_compressed);
+    }
+
+    #[test]
+    fn test_can_passthrough_audio() {
+        // AAC stéréo 128 kbps (string) -> true
+        let aac_stereo_128k = json!({
+            "streams": [
+                { "codec_type": "video", "codec_name": "h264" },
+                { "codec_type": "audio", "codec_name": "aac", "channels": 2, "bit_rate": "128000" }
+            ]
+        });
+        assert!(can_passthrough_audio(&aac_stereo_128k));
+
+        // AAC mono 96 kbps (u64, majuscules) -> true
+        let aac_mono_96k = json!({
+            "streams": [
+                { "codec_type": "audio", "codec_name": "AAC", "channels": 1, "bit_rate": 96_000 }
+            ]
+        });
+        assert!(can_passthrough_audio(&aac_mono_96k));
+
+        // AAC 5.1 (6 canaux) -> false
+        let aac_surround = json!({
+            "streams": [
+                { "codec_type": "audio", "codec_name": "aac", "channels": 6, "bit_rate": "128000" }
+            ]
+        });
+        assert!(!can_passthrough_audio(&aac_surround));
+
+        // AAC haut débit (256 kbps > 135 kbps) -> false
+        let aac_high_br = json!({
+            "streams": [
+                { "codec_type": "audio", "codec_name": "aac", "channels": 2, "bit_rate": "256000" }
+            ]
+        });
+        assert!(!can_passthrough_audio(&aac_high_br));
+
+        // Autre codec audio (mp3 / pcm_s16le / opus) -> false
+        let mp3_stream = json!({
+            "streams": [
+                { "codec_type": "audio", "codec_name": "mp3", "channels": 2, "bit_rate": "128000" }
+            ]
+        });
+        assert!(!can_passthrough_audio(&mp3_stream));
+
+        // Bitrate manquant ou pas de flux audio -> false
+        let no_bitrate = json!({
+            "streams": [
+                { "codec_type": "audio", "codec_name": "aac", "channels": 2 }
+            ]
+        });
+        assert!(!can_passthrough_audio(&no_bitrate));
+
+        let no_audio = json!({
+            "streams": [
+                { "codec_type": "video", "codec_name": "h264" }
+            ]
+        });
+        assert!(!can_passthrough_audio(&no_audio));
     }
 }

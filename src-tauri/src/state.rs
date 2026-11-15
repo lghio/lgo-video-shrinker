@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
@@ -11,6 +12,30 @@ pub const DEFAULT_SCAN_DIRECTORY: &str =
     r"C:\Users\ferie\OneDrive - English with Feriel\__Project\Neuro Language Coaching";
 
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+pub const ES_CONTINUOUS: u32 = 0x80000000;
+pub const ES_SYSTEM_REQUIRED: u32 = 0x00000001;
+
+#[cfg(windows)]
+extern "system" {
+    fn SetThreadExecutionState(es_flags: u32) -> u32;
+}
+
+/// Active ou désactive la prévention de la mise en veille Windows pendant l'encodage.
+/// Retourne les flags appliqués (`ES_CONTINUOUS | ES_SYSTEM_REQUIRED` ou `ES_CONTINUOUS`).
+pub fn set_prevent_sleep(prevent: bool) -> u32 {
+    let flags = if prevent {
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+
+    #[cfg(windows)]
+    unsafe {
+        let _ = SetThreadExecutionState(flags);
+    }
+
+    flags
+}
 
 pub struct ActiveCompression {
     pub pid: Option<u32>,
@@ -20,21 +45,30 @@ pub struct ActiveCompression {
 
 pub struct AppState {
     pub hw_encoder: String,
+    pub hw_encoder_hevc: String,
+    pub gpu_name: Option<String>,
+    pub is_rtx: bool,
     pub ffmpeg_path: PathBuf,
     pub ffprobe_path: PathBuf,
     pub default_directory: String,
     pub active_processes: Arc<Mutex<HashMap<usize, ActiveCompression>>>,
+    pub scan_cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AppInfoResponse {
     pub version: String,
     pub hw_encoder: String,
+    pub hw_encoder_hevc: String,
+    pub gpu_name: Option<String>,
+    pub is_rtx: bool,
     pub default_directory: String,
+    pub changelog_markdown: String,
 }
 
 impl AppState {
     pub fn cleanup_all(&self) {
+        self.scan_cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut map) = self.active_processes.lock() {
             for (_, mut active) in map.drain() {
                 if let Some(tx) = active.cancel_tx.take() {
@@ -47,6 +81,7 @@ impl AppState {
                     let _ = std::fs::remove_file(&active.temp_path);
                 }
             }
+            set_prevent_sleep(false);
         }
     }
 }
@@ -141,5 +176,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_set_prevent_sleep_returns_expected_flags() {
+        let active_flags = set_prevent_sleep(true);
+        assert_eq!(active_flags, ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+
+        let cleared_flags = set_prevent_sleep(false);
+        assert_eq!(cleared_flags, ES_CONTINUOUS);
     }
 }

@@ -1,7 +1,6 @@
 ---
 name: update-context
 description: "Use when: updating CONTEXT.md, refreshing project context, documenting session changes in CHANGELOG.md, running /update-context, or synchronizing project structure and technical conventions."
-agent: agent
 ---
 
 # Update Context — lgo-video-shrinker
@@ -12,7 +11,7 @@ Mets à jour le fichier `CONTEXT.md` (et `CHANGELOG.md`) à la racine du projet 
 
 ## Étape 1 — Lister tous les fichiers du projet
 
-Liste les fichiers du projet (hors `.venv/`, `venv/`, `.git/`, `__pycache__/`, `node_modules/`, `build/`, `dist/`, `electron/node_modules/`, `electron/dist/`, `src-tauri/target/`) pour détecter les nouveaux fichiers, déplacements ou suppressions.
+Liste les fichiers du projet (hors `.git/`, `node_modules/`, `dist-frontend/`, `src-tauri/target/`) pour détecter les nouveaux fichiers, déplacements ou suppressions.
 
 ## Étape 2 — Mettre à jour la section "Project structure" de `CONTEXT.md`
 

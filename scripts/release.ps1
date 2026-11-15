@@ -38,14 +38,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Echec du build frontend ('npm run build'). Release annulee avant toute modification des fichiers de version."
 }
 
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 if ($LASTEXITCODE -ne 0) {
     throw "Echec des tests Rust ('cargo test'). Release annulee avant toute modification des fichiers de version."
 }
 
 # 3. Mettre a jour package.json
 $pkgPath = Join-Path $projectRoot "package.json"
-$pkg = Get-Content -Raw $pkgPath | ConvertFrom-Json
+$pkg = Get-Content -Raw -Encoding UTF8 $pkgPath | ConvertFrom-Json
 $pkg.version = $Version
 $pkgJson = $pkg | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($pkgPath, $pkgJson + "`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -53,7 +53,7 @@ Write-Host "[3/6] package.json -> $Version"
 
 # 4. Mettre a jour src-tauri/tauri.conf.json
 $tauriConfPath = Join-Path $projectRoot "src-tauri\tauri.conf.json"
-$tauriConf = Get-Content -Raw $tauriConfPath | ConvertFrom-Json
+$tauriConf = Get-Content -Raw -Encoding UTF8 $tauriConfPath | ConvertFrom-Json
 $tauriConf.version = $Version
 $tauriConfJson = $tauriConf | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($tauriConfPath, $tauriConfJson + "`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -61,7 +61,7 @@ Write-Host "[4/6] src-tauri/tauri.conf.json -> $Version"
 
 # 5. Mettre a jour src-tauri/Cargo.toml
 $cargoPath = Join-Path $projectRoot "src-tauri\Cargo.toml"
-$cargoContent = Get-Content -Raw $cargoPath
+$cargoContent = Get-Content -Raw -Encoding UTF8 $cargoPath
 $cargoContent = [regex]::Replace($cargoContent, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
 [System.IO.File]::WriteAllText($cargoPath, $cargoContent, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "[5/6] src-tauri/Cargo.toml -> $Version"

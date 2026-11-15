@@ -7,7 +7,6 @@ src-tauri/binaries/*.exe
 
 # Node / Vite frontend build
 node_modules/
-dist-frontend/
 
 # Secrets & Tauri updater private keys (NEVER commit private keys)
 .env
