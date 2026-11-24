@@ -55,3 +55,5 @@ Return:
 - Signing key & GitHub Secret status
 - GitHub Actions workflow run status and URL (`https://github.com/lghio/lgo-video-shrinker/actions`)
 - Published GitHub Release URL and verified assets (`latest.json`, `.exe`, `.sig`)
+
+
